@@ -1,0 +1,9 @@
+opencv-python
+Pillow
+google-generativeai
+ipykernelcd 
+pandas openpyxl
+scikit-learn
+matplotlib
+seaborn
+sentence_transformers
