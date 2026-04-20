@@ -17,6 +17,12 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 from sentence_transformers import SentenceTransformer, util
 import itertools
 import torch
+try:
+    import plotly.express as px
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+    print("Hinweis: plotly nicht installiert. Treemap-Plots werden übersprungen. (pip install plotly kaleido)")
 
 
 
@@ -1053,6 +1059,51 @@ def run_intra_model_consistency_check(df_master):
     
     print("Consistency Plots (Boxplot & BarChart) gespeichert.")
 
+def analyze_region_coverage(df):
+    """
+    Zeigt, wie oft Audio, Body und Background in den Justifications vorkommen.
+    Hilft zu entscheiden, ob diese Kategorien weiter unterteilt werden sollten.
+    """
+    justification_cols = [f'justification{s}' for s in RUN_SUFFIXES]
+    justification_cols = [c for c in justification_cols if c in df.columns]
+    if not justification_cols:
+        print("Keine Justification-Spalten gefunden.")
+        return
+
+    all_texts = pd.concat(
+        [df[c].dropna().astype(str) for c in justification_cols]
+    ).str.lower()
+    total = len(all_texts)
+
+    REGION_PATTERNS = {
+        'Audio – Voice/Speech':  r'voice|speech|pronunciation|accent|audio',
+        'Audio – Lip Sync':      r'lip.?sync|synchroni|mouth movement',
+        'Body – Head/Neck':      r'\bneck\b|\bhead\b',
+        'Body – Shoulders/Torso':r'shoulder|torso|chest|body',
+        'Body – Hands':          r'\bhand\b|\bhands\b|\bfinger',
+        'Background – Lighting': r'lighting|illuminat|shadow|light source|brightness',
+        'Background – Scene':    r'\bscene\b|background|environment|setting',
+        'Background – Temporal': r'flicker|temporal|inconsisten|over time|frame.to.frame',
+    }
+
+    print("\n=== Region Coverage in Justifications ===")
+    print(f"Gesamt-Justifications: {total}\n")
+
+    results = []
+    for label, pattern in REGION_PATTERNS.items():
+        count = all_texts.str.contains(pattern, regex=True).sum()
+        pct   = round(count / total * 100, 1)
+        results.append({'Kategorie': label, 'Treffer': count, 'Anteil (%)': pct})
+        print(f"  {label:<35} {count:>5}x  ({pct}%)")
+
+    df_res = pd.DataFrame(results)
+    save_path = os.path.join(base_plot_folder, 'region_coverage.xlsx')
+    df_res.to_excel(save_path, index=False)
+    print(f"\n -> Ergebnisse gespeichert: {save_path}")
+    print("\nEmpfehlung: Kategorien mit < 5% sind für eine Unterteilung meist zu dünn besetzt.")
+    return df_res
+
+
 def export_keyword_inventory(df):
     """Extrahiert alle Keywords (1-3 Wörter) über alle Runs hinweg und speichert sie hartcodiert als CSV."""
     
@@ -1089,91 +1140,290 @@ def export_keyword_inventory(df):
     return inventory
 
 
-def cluster_keywords(inventory_df, output_filename='keyword_inventory_mare_clustered.xlsx'):
+def cluster_keywords(inventory_df, output_filename='keyword_inventory_clustered.xlsx'):
     """
-    Nutzt die offiziellen MARE-Keywords als Anker für das SBERT-Clustering.
-    """
-    print(" -> Starte SBERT-Clustering mit MARE-Ankern...")
+    Jedes Keyword wird via SBERT einem MARE-Begriff (Level 3) zugeordnet.
+    Level 2 und Level 1 werden statisch aus der Hierarchie abgeleitet:
 
-    # 1. Modell laden
+    Frame
+    ├── Face       → MARE-Regionen (Skin, Nose, Mouth, ...)
+    ├── Body       → Head_Neck, Torso, Hands
+    └── Background → Lighting, Scene, Temporal
+
+    Audio
+    ├── Voice      → Stimme, Sprache, Klang
+    └── Lip_Sync   → Lippensynchronität
+    """
+    print(" -> Starte SBERT-Clustering")
+
     model = model_sbert
 
-    # 2. Anker-Mapping basierend auf MARE Paper
-    mare_anchors = {
-        'Skin': 'skin, cheek, forehead, complexion, dermal, face',
-        'Nose': 'nose, nostril, nasal',
-        'Mouth': 'mouth, lip, lips',
-        'Teeth': 'tooth, teeth',
-        'Left_Eye': 'left eye, left-eye, l eye, lefteye, eye, ocular',
-        'Right_Eye': 'right eye, right-eye, r eye, righteye, eye, ocular',
-        'Left_Eyebrow': 'left eyebrow, left brow, left-eyebrow, eyebrow, brow',
-        'Right_Eyebrow': 'right eyebrow, right brow, right-eyebrow, eyebrow, brow',
-        'Chin': 'chin, jaw, jawline, lower face',
-        'Beard': 'beard, mustache, moustache, goatee',
-        'Hairline': 'hairline, hair line, hair',
-        'Ear': 'ear, ears'
+    # Level-3-Anker: SBERT ordnet jedes Keyword einem dieser Begriffe zu
+    ANCHORS = {
+        # MARE Gesichtsregionen
+        'Skin':          'skin, cheek, forehead, complexion, dermal',
+        'Nose':          'nose, nostril, nasal',
+        'Mouth':         'mouth, lip, lips',
+        'Teeth':         'tooth, teeth',
+        'Left_Eye':      'left eye, left-eye, lefteye, eye, ocular',
+        'Right_Eye':     'right eye, right-eye, righteye, eye, ocular',
+        'Left_Eyebrow':  'left eyebrow, left brow, eyebrow, brow',
+        'Right_Eyebrow': 'right eyebrow, right brow, eyebrow, brow',
+        'Chin':          'chin, jaw, jawline, lower face',
+        'Beard':         'beard, mustache, moustache, goatee',
+        'Hairline':      'hairline, hair line, hair',
+        'Ear':           'ear, ears',
+        # Body
+        'Head_Neck':     'neck, head, throat',
+        'Torso':         'shoulder, torso, chest, arm, posture',
+        'Hands':         'hand, hands, finger, fingers',
+        # Background
+        'Lighting':      'lighting, illumination, shadow, brightness, light source',
+        'Scene':         'scene, background, environment, setting',
+        'Temporal':      'flickering, temporal, inconsistency, frame rate, over time',
+        # Audio
+        'Voice':         'voice, speech, pronunciation, accent, audio, sound, tone',
+        'Lip_Sync':      'lip sync, synchronization, mouth movement, lipsync',
     }
 
-    region_names = list(mare_anchors.keys())
-    anchor_texts = list(mare_anchors.values())
+    # Statische Hierarchie: Level 3 → (Level 2, Level 1)
+    REGION_HIERARCHY = {
+        'Skin':            ('Face',       'Frame'),
+        'Nose':            ('Face',       'Frame'),
+        'Mouth':           ('Face',       'Frame'),
+        'Teeth':           ('Face',       'Frame'),
+        'Left_Eye':        ('Face',       'Frame'),
+        'Right_Eye':       ('Face',       'Frame'),
+        'Left_Eyebrow':    ('Face',       'Frame'),
+        'Right_Eyebrow':   ('Face',       'Frame'),
+        'Chin':            ('Face',       'Frame'),
+        'Beard':           ('Face',       'Frame'),
+        'Hairline':        ('Face',       'Frame'),
+        'Ear':             ('Face',       'Frame'),
+        'Head_Neck':       ('Body',       'Frame'),
+        'Torso':           ('Body',       'Frame'),
+        'Hands':           ('Body',       'Frame'),
+        'Lighting':        ('Background', 'Frame'),
+        'Scene':           ('Background', 'Frame'),
+        'Temporal':        ('Background', 'Frame'),
+        'Voice':           ('Audio',      'Audio'),
+        'Lip_Sync':        ('Audio',      'Audio'),
+        'Audio':           ('Audio',      'Audio'),
+        'Other/Technical': ('Background', 'Frame'),
+    }
 
-    # 3. Embeddings berechnen
-    # Wir berechnen die Vektoren für die MARE-Gruppen und deine extrahierten Keywords
-    region_embeddings = model.encode(anchor_texts, convert_to_tensor=True)
-    keyword_list = inventory_df['keyword'].tolist()
+    df = inventory_df.copy()
+
+    region_names = list(ANCHORS.keys())
+    anchor_texts = list(ANCHORS.values())
+
+    # Embeddings & Cosine Similarity
+    region_embeddings  = model.encode(anchor_texts, convert_to_tensor=True)
+    keyword_list       = df['keyword'].tolist()
     keyword_embeddings = model.encode(keyword_list, convert_to_tensor=True)
 
-    # 4. Cosine Similarity (Semantischer Vergleich)
     cosine_scores = util.cos_sim(keyword_embeddings, region_embeddings)
+    best_indices  = torch.argmax(cosine_scores, dim=1).tolist()
+    confidences   = torch.max(cosine_scores, dim=1).values.tolist()
 
-    # 5. Zuweisung
-    # Wir suchen für jedes Keyword die Region mit der höchsten Ähnlichkeit
-    best_region_indices = torch.argmax(cosine_scores, dim=1).tolist()
-    confidences = torch.max(cosine_scores, dim=1).values.tolist()
+    # Level 3 zuweisen
+    df['level_3']    = [region_names[i] for i in best_indices]
+    df['confidence'] = confidences
 
-    inventory_df['assigned_region'] = [region_names[i] for i in best_region_indices]
-    inventory_df['confidence'] = confidences
+    # Zu unsichere Zuweisungen → Other/Technical
+    df.loc[df['confidence'] < 0.4, 'level_3'] = 'Other/Technical'
 
-    # Schwellenwert: Wenn die Ähnlichkeit zu gering ist (< 0.4), markieren wir es als 'Other/Technical'
-    inventory_df.loc[inventory_df['confidence'] < 0.4, 'assigned_region'] = 'Other/Technical'
+    # Level 2 und Level 1 aus statischer Hierarchie ableiten
+    # Fallback: Background/Frame für unbekannte Werte
+    df['level_2'] = df['level_3'].map(
+        lambda r: REGION_HIERARCHY.get(r, ('Background', 'Frame'))[0]
+    )
+    df['level_1'] = df['level_3'].map(
+        lambda r: REGION_HIERARCHY.get(r, ('Background', 'Frame'))[1]
+    )
 
-    # 6. Speichern
+    # Debug: Grenzfälle mit allen Scores speichern
+    scores_df = pd.DataFrame(
+        cosine_scores.cpu().numpy(),
+        columns=region_names,
+        index=keyword_list
+    )
+    scores_df.index.name = 'keyword'
+    scores_df['winner']     = df['level_3'].values
+    scores_df['confidence'] = confidences
+    ambiguous = scores_df[scores_df['confidence'] < 0.5].reset_index()
+    if not ambiguous.empty:
+        debug_path = os.path.join(base_plot_folder, 'debug_ambiguous_keywords.xlsx')
+        ambiguous.to_excel(debug_path, index=False)
+        print(f" -> {len(ambiguous)} mehrdeutige Keywords gespeichert: {debug_path}")
+
+    # Speichern: sortiert nach Hierarchie
+    df = df.sort_values(
+        by=['level_1', 'level_2', 'level_3', 'confidence'],
+        ascending=[True, True, True, False]
+    )
     save_path = os.path.join(base_plot_folder, output_filename)
-    # Sortierung für den Audit (Review)
-    inventory_df = inventory_df.sort_values(by=['assigned_region', 'confidence'], ascending=[True, False])
-    inventory_df.to_excel(save_path, index=False)
-    
-    print(f"Keyword-Clustering abgeschlossen. Datei gespeichert: {save_path}")
-    return inventory_df
+    df.to_excel(save_path, index=False)
 
-# --- MODUL 2: EINZEL-PLOTS (PRO MODELL & RUN) ---
-def plot_individual_keywords(texts, model_name, condition_label, save_folder, run_label):
-    """Erstellt einen Balkenchart der Top-Phrasen für ein Modell/Szenario."""
-    if not texts or len(texts) < 3: 
+    print(f"Keyword-Clustering abgeschlossen. Datei gespeichert: {save_path}")
+    return df
+
+# --- MODUL 2: KEYWORD-PLOTS MIT HIERARCHIE & TP/FP-FARBEN ---
+
+def _extract_keyword_counts(texts, max_features=100):
+    """Extrahiert 1-3-Gramm Keywords und Häufigkeiten aus einer Textliste."""
+    if not texts or len(texts) < 3:
+        return pd.DataFrame(columns=['keyword', 'count'])
+    cv = CountVectorizer(ngram_range=(1, 3), stop_words=DOMAIN_STOPS, max_features=max_features)
+    try:
+        mat = cv.fit_transform(texts)
+        return pd.DataFrame({'keyword': cv.get_feature_names_out(), 'count': mat.sum(axis=0).A1})
+    except ValueError:
+        return pd.DataFrame(columns=['keyword', 'count'])
+
+
+def _plot_tp_fp_bars(df_data, x_col, title, filename, save_folder):
+    """Horizontaler Balkenplot: TP (grün) und FP (rot) nebeneinander."""
+    if df_data.empty:
+        return
+    df_melted = df_data.melt(
+        id_vars=[x_col], value_vars=['TP', 'FP'],
+        var_name='Type', value_name='Count'
+    )
+    height = max(4, len(df_data) * 0.6 + 1)
+    plt.figure(figsize=(10, height))
+    sns.barplot(
+        data=df_melted, x='Count', y=x_col, hue='Type',
+        palette={'TP': '#2ca25f', 'FP': '#de2d26'},
+        orient='h'
+    )
+    plt.title(title, fontsize=11)
+    plt.xlabel("Häufigkeit")
+    plt.ylabel("")
+    plt.legend(title="")
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_folder, filename), dpi=200)
+    plt.close()
+
+
+def plot_treemap_keywords(df_kw, model_name, run_label, save_folder):
+    """
+    Interaktive Treemap (HTML) + statisches PNG.
+    Fläche = Gesamthäufigkeit, Farbe = TP-Anteil (grün = TP-dominiert, rot = FP-dominiert).
+    """
+    if not PLOTLY_AVAILABLE:
         return
 
-    # Fokus auf 2-3 Wörter für mehr Kontext
-    cv = CountVectorizer(ngram_range=(2, 3), stop_words=DOMAIN_STOPS, max_features=15)
-    try:
-        counts = cv.fit_transform(texts)
-        df_plot = pd.DataFrame({
-            'Phrase': cv.get_feature_names_out(),
-            'Count': counts.sum(axis=0).A1
-        }).sort_values(by='Count', ascending=False)
+    df = df_kw[df_kw['keyword'].str.split().str.len() >= 2].copy()
+    df['total'] = df['TP'] + df['FP']
+    df = df[df['total'] > 0]
+    if df.empty:
+        return
 
-        plt.figure(figsize=(10, 6))
-        sns.barplot(data=df_plot, x='Count', y='Phrase', hue='Phrase', palette='flare', legend=False)
-        plt.title(f"Run: {run_label}\nModel: {model_name} ({condition_label})", fontsize=12)
-        plt.xlabel("Häufigkeit")
-        plt.ylabel("")
-        plt.tight_layout()
-        
-        filename = f"{model_name}_{condition_label}_{run_label}.png"
-        plt.savefig(os.path.join(save_folder, filename), dpi=300)
-        plt.close()
-        
-    except ValueError:
-        pass # Falls keine n-gramme extrahierbar sind
+    df['tp_ratio'] = df['TP'] / df['total']
+    plot_label = get_plot_label(model_name)
+    safe_name  = re.sub(r'[^\w\-_]', '_', model_name)
+
+    fig = px.treemap(
+        df,
+        path=[px.Constant('All'), 'level_1', 'level_2', 'level_3', 'keyword'],
+        values='total',
+        color='tp_ratio',
+        color_continuous_scale=['#de2d26', '#f7f7f7', '#2ca25f'],
+        color_continuous_midpoint=0.5,
+        range_color=[0, 1],
+        title=f"{plot_label} | {run_label}",
+        hover_data={'TP': True, 'FP': True, 'tp_ratio': ':.2f'},
+    )
+    fig.update_traces(textinfo='label+value')
+    fig.update_layout(
+        margin=dict(t=50, l=10, r=10, b=10),
+        coloraxis_colorbar=dict(title='TP-Anteil', tickvals=[0, 0.5, 1], ticktext=['FP', '50/50', 'TP'])
+    )
+
+    html_path = os.path.join(save_folder, f"{safe_name}_treemap_{run_label}.html")
+    fig.write_html(html_path)
+
+    try:
+        png_path = os.path.join(save_folder, f"{safe_name}_treemap_{run_label}.png")
+        fig.write_image(png_path, width=1400, height=900)
+    except Exception:
+        pass  # kaleido nicht installiert — nur HTML gespeichert
+
+
+def plot_diverging_bars(df_kw, group_col, model_name, run_label, save_folder, level_name, top_n=20):
+    """
+    Diverging Bar Chart: TP-Balken nach rechts (grün), FP-Balken nach links (rot).
+    Sofort sichtbar welche Keywords/Gruppen FP- oder TP-charakteristisch sind.
+    """
+    df = df_kw.groupby(group_col)[['TP', 'FP']].sum().reset_index()
+    df['total'] = df['TP'] + df['FP']
+    df = df[df['total'] > 0].nlargest(top_n, 'total').sort_values('total')
+
+    if df.empty:
+        return
+
+    plot_label = get_plot_label(model_name)
+    safe_name  = re.sub(r'[^\w\-_]', '_', model_name)
+    labels     = df[group_col].tolist()
+    max_val    = df[['TP', 'FP']].max().max()
+
+    _, ax = plt.subplots(figsize=(11, max(4, len(df) * 0.55 + 1)))
+
+    ax.barh(labels, df['TP'].values,  color='#2ca25f', label='TP', zorder=2)
+    ax.barh(labels, -df['FP'].values, color='#de2d26', label='FP', zorder=2)
+    ax.axvline(0, color='black', linewidth=1, zorder=3)
+
+    offset = max_val * 0.015
+    for idx, row in enumerate(df.itertuples()):
+        if row.TP > 0:
+            ax.text(row.TP + offset, idx, str(int(row.TP)),
+                    va='center', fontsize=8, color='#2ca25f')
+        if row.FP > 0:
+            ax.text(-row.FP - offset, idx, str(int(row.FP)),
+                    va='center', ha='right', fontsize=8, color='#de2d26')
+
+    ax.set_xlabel('← FP  |  TP →', fontsize=10)
+    ax.set_title(f"{plot_label} | {run_label} | {level_name}", fontsize=11)
+    ax.legend(loc='lower right')
+    ax.grid(axis='x', linestyle='--', alpha=0.4, zorder=1)
+    plt.tight_layout()
+
+    filename = f"{safe_name}_diverging_{level_name}_{run_label}.png"
+    plt.savefig(os.path.join(save_folder, filename), dpi=200)
+    plt.close()
+
+
+def plot_keywords_hierarchical(tp_texts, fp_texts, model_name, run_label, save_folder, clustered_df):
+    """
+    Erstellt Keyword-Plots auf allen 3 Hierarchie-Ebenen mit TP (grün) und FP (rot).
+    Level 3: Top-Keywords (2+ Wörter), Level 2: nach Region aggregiert, Level 1: nach Modalität.
+    """
+    tp_kw = _extract_keyword_counts(tp_texts).rename(columns={'count': 'TP'})
+    fp_kw = _extract_keyword_counts(fp_texts).rename(columns={'count': 'FP'})
+
+    if tp_kw.empty and fp_kw.empty:
+        return
+
+    df_kw = pd.merge(tp_kw, fp_kw, on='keyword', how='outer').fillna(0).infer_objects(copy=False)
+    df_kw[['TP', 'FP']] = df_kw[['TP', 'FP']].astype(int)
+    df_kw['total'] = df_kw['TP'] + df_kw['FP']
+
+    # Hierarchie-Labels aus clustered_df anhängen
+    lookup = clustered_df[['keyword', 'level_1', 'level_2', 'level_3']].drop_duplicates('keyword')
+    df_kw = pd.merge(df_kw, lookup, on='keyword', how='inner')
+
+    if df_kw.empty:
+        return
+
+    # --- Treemap: gesamte Hierarchie auf einen Blick ---
+    plot_treemap_keywords(df_kw, model_name, run_label, save_folder)
+
+    # --- Diverging Bar Charts: TP vs. FP pro Ebene ---
+    plot_diverging_bars(df_kw, 'keyword',  model_name, run_label, save_folder, 'L4_Keywords',    top_n=20)
+    plot_diverging_bars(df_kw, 'level_3',  model_name, run_label, save_folder, 'L3_MARE',        top_n=20)
+    plot_diverging_bars(df_kw, 'level_2',  model_name, run_label, save_folder, 'L2_Regions',     top_n=10)
+    plot_diverging_bars(df_kw, 'level_1',  model_name, run_label, save_folder, 'L1_Modality',    top_n=5)
 
     
 
@@ -1229,34 +1479,34 @@ def plot_hallucination_matrix(aggregated_fp_dict, output_path, expected_models):
 def run_justification_deep_analysis(df_master):
     """Koordiniert die gesamte Analyse."""
     
-    # 1. Zentrales Inventar für das Mapping erstellen und clustern
-    inventory_df = export_keyword_inventory(df_master)
-    if inventory_df is not None:
-        cluster_keywords(inventory_df)
-    
-    aggregated_fps = {} 
+    # 1. Coverage-Check: lohnt sich Unterteilung von Audio/Body/Background?
+    #analyze_region_coverage(df_master)
 
-    # 2. Durch alle Runs und Modelle iterieren
-    # (Annahme: iterate_runs ist eine existierende Hilfsfunktion)
+    # 2. Zentrales Inventar für das Mapping erstellen und clustern
+    inventory_df = export_keyword_inventory(df_master)
+    clustered_df = cluster_keywords(inventory_df) if inventory_df is not None else None
+
+    aggregated_fps = {}
+
+    # 3. Durch alle Runs und Modelle iterieren
     for run_label, df_run in iterate_runs(df_master):
-        
+
         run_folder = os.path.join(base_plot_folder, run_label, 'Keywords_Analysis')
         os.makedirs(run_folder, exist_ok=True)
-        
+
         for model_name, model_df in df_run.groupby('base_model'):
-            # Masken für TP und FP (Halluzinationen)
             tp_mask = (model_df['y_true'] == 1) & (model_df['y_pred'] == 1)
             fp_mask = (model_df['y_true'] == 0) & (model_df['y_pred'] == 1)
-            
+
             tp_list = model_df[tp_mask]['justification'].dropna().tolist()
             fp_list = model_df[fp_mask]['justification'].dropna().tolist()
-            
-            # Einzel-Plots erstellen
-            plot_individual_keywords(tp_list, model_name, "TP", run_folder, run_label)
-            plot_individual_keywords(fp_list, model_name, "FP", run_folder, run_label)
-            
+
+            # Hierarchische Plots (L1 / L2 / L3) mit TP (grün) und FP (rot)
+            if clustered_df is not None:
+                plot_keywords_hierarchical(tp_list, fp_list, model_name, run_label, run_folder, clustered_df)
+
             # Für die globale Matrix sammeln
-            if model_name not in aggregated_fps: 
+            if model_name not in aggregated_fps:
                 aggregated_fps[model_name] = []
             aggregated_fps[model_name].extend(fp_list)
 
