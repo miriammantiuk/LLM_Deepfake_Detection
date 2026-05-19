@@ -3,36 +3,30 @@ import json
 import glob
 import os
 import numpy as np
+import cv2
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import chi2_contingency, fisher_exact
 from sklearn.metrics import (accuracy_score, f1_score, precision_score, 
                              recall_score, confusion_matrix, roc_auc_score, roc_curve, auc)
-from sklearn.ensemble import RandomForestClassifier
 import re
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from sentence_transformers import SentenceTransformer
-from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+from sklearn.feature_extraction.text import CountVectorizer, ENGLISH_STOP_WORDS
 from sentence_transformers import SentenceTransformer, util
 import itertools
 import torch
-try:
-    import plotly.express as px
-    PLOTLY_AVAILABLE = True
-except ImportError:
-    PLOTLY_AVAILABLE = False
-    print("Hinweis: plotly nicht installiert. Treemap-Plots werden übersprungen. (pip install plotly kaleido)")
+import plotly.express as px
+
 
 
 
 # ---------------------------------------------------------
 # GLOBALE KONFIGURATION
 # ---------------------------------------------------------
-JSON_FOLDER = '.'               
-INFO_DATEI = 'dataset_info.xlsx' 
-VIDEO_SOURCE_PATH = r'data\processed'  
-SUMMARIZED_FILE = 'results_summarized.xlsx'
+JSON_FOLDER = '.'
+INFO_DATEI = 'dataset_info.xlsx'
+VIDEO_SOURCE_PATH = r'data\processed'
+RESULTS_FOLDER = 'results'
+SUMMARIZED_FILE = os.path.join(RESULTS_FOLDER, 'results_summarized.xlsx')
 
 # ========== BASE MODEL NAMES ==========
 BASE_MODEL_DISPLAY_NAMES = {
@@ -88,7 +82,7 @@ def get_model_color(model_name):
 
 # Listen zentral definieren
 RUN_SUFFIXES = ["_1", "_2", "_3"]
-META_COLS = ['dataset', 'gender', 'video_length','deepfake_category','deepfake_type']
+META_COLS = ['dataset', 'gender', 'video_length','deepfake_category','deepfake_type', 'audio']
 
 # Plotting Style
 sns.set_style("whitegrid")
@@ -97,6 +91,7 @@ plt.rcParams.update({'figure.max_open_warning': 0})
 # Hauptordner für Plots
 base_plot_folder = 'plots'
 os.makedirs(base_plot_folder, exist_ok=True)
+os.makedirs(RESULTS_FOLDER, exist_ok=True)
 
 
 # Stopwörter für die Keyword-Analyse 
@@ -107,12 +102,140 @@ DOMAIN_STOPS = list(ENGLISH_STOP_WORDS) + [
     'anomalies', 'artifacts', 'signs', 'potential', 'deepfake'
 ]
 
+# Globale Anker-Definitionen — genutzt von cluster_keywords UND analyze_region_coverage
+KEYWORD_ANCHORS = {
+    # MARE 
+    'Skin':          'skin, cheek, forehead, complexion, dermal, face',
+    'Nose':          'nose, nostril, nasal',
+    'Mouth':         'mouth, lip, lips',
+    'Teeth':         'tooth, teeth',
+    'Eye':           'right-eye, left-eye, eye, ocular',
+    'Eyebrow':       'right-eyebrow, left-eyebrow, eyebrow, brow',
+    'Chin':          'chin, jaw, jawline, lower face',
+    'Beard':         'beard, mustache, moustache, goatee',
+    'Hairline':      'hairline, hair line, hair',
+    'Ear':           'ear, ears',
+    # Ergänzte Keywords Body
+    'Head_Neck':     'neck, head, throat',
+    'Torso':         'shoulder, torso, chest, arm, posture',
+    'Hands':         'hand, hands, finger, fingers',
+    # Ergänzte Keywords Background
+    'Lighting':      'lighting, illumination, shadow, brightness, light source',
+    'Scene':         'scene, background, environment, setting',
+    'Temporal':      'flickering, temporal, inconsistency, frame rate',
+    'General_Artifacts':     'edge, noise, blur, blending, compression, artifact, consistent, natural',
+  
+    # Ergänzte Keywords Audio
+    'Voice':         'voice, speech, pronunciation, accent, audio, sound, tone',
+    'Lip_Sync':      'lip sync, synchronization, mouth movement, lipsync',
+}
+
+KEYWORD_HIERARCHY = {
+    'Skin':            ('Face',       'Frame'),
+    'Nose':            ('Face',       'Frame'),
+    'Mouth':           ('Face',       'Frame'),
+    'Teeth':           ('Face',       'Frame'),
+    'Eye':             ('Face',       'Frame'),
+    'Eyebrow':         ('Face',       'Frame'),
+    'Chin':            ('Face',       'Frame'),
+    'Beard':           ('Face',       'Frame'),
+    'Hairline':        ('Face',       'Frame'),
+    'Ear':             ('Face',       'Frame'),
+    'Head_Neck':       ('Body',       'Frame'),
+    'Torso':           ('Body',       'Frame'),
+    'Hands':           ('Body',       'Frame'),
+    'Lighting':        ('Background', 'Frame'),
+    'Scene':           ('Background', 'Frame'),
+    'Temporal':        ('Background', 'Frame'),
+    'Voice':           ('Audio',      'Audio'),
+    'Lip_Sync':        ('Audio',      'Audio'),
+    'General_Artifacts': ('Background', 'Frame'),
+}
+
 # SBERT zentral laden (für semantische Analysen)
-model_sbert = SentenceTransformer('all-MiniLM-L6-v2')
+_model_sbert = None
+
+def get_sbert():
+    global _model_sbert
+    if _model_sbert is None:
+        print(" -> Lade SBERT-Modell (all-MiniLM-L6-v2)...")
+        _model_sbert = SentenceTransformer('all-MiniLM-L6-v2')
+    return _model_sbert
 
 # ---------------------------------------------------------
 # HILFSFUNKTIONEN (METRIKEN & LOGIK)
 # ---------------------------------------------------------
+
+def run_baseline_distribution_analysis(df_master, save_folder="Baseline_Distributions"):
+    """
+    Erstellt Basisverteilungs-Plots für ALLE Features im Datensatz, um 
+    Sampling Bias vor der eigentlichen Auswertung sichtbar zu machen.
+    - Numerische Features -> Histogramm
+    - Kategoriale Features -> Countplot (Balkendiagramm)
+    """
+    print("\n=== Baseline Distribution Analysis (Datensatzübersicht) ===")
+    
+    target_folder = os.path.join(base_plot_folder, save_folder)
+    os.makedirs(target_folder, exist_ok=True)
+    
+    # CRITICAL: Duplikate entfernen, um auf exakt N=50 Videos zu kommen
+    if 'video_id' in df_master.columns:
+        df_unique = df_master.drop_duplicates(subset=['video_id']).copy()
+    else:
+        print(" Warnung: Spalte 'video_id' nicht gefunden. Verteilung könnte verzerrt sein!")
+        df_unique = df_master.copy()
+        
+    n_videos = len(df_unique)
+    print(f" -> Analysiere einzigartige Videos: N = {n_videos}")
+
+    for feat in META_COLS:
+        if feat not in df_unique.columns:
+            continue
+            
+        plt.figure(figsize=(7, 4))
+        
+        # 1. FALL: Numerische Features (z.B. video_length)
+        if pd.api.types.is_numeric_dtype(df_unique[feat]):
+            sns.histplot(data=df_unique, x=feat, discrete=True, kde=True, 
+             color='#4e79a7', edgecolor='white', linewidth=1.2)
+            plt.title(f'Basisverteilung (Numerisch): {feat} (N={n_videos})', fontsize=12, fontweight='bold')
+            plt.xlabel(feat, fontsize=10)
+        
+        # 2. FALL: Kategoriale Features (z.B. dataset, deepfake_category)
+        else:
+            # Sortiere Balken nach Häufigkeit für eine sauberere Optik
+            order = df_unique[feat].value_counts().index
+            ax = sns.countplot(data=df_unique, x=feat, order=order, palette='Set2')
+            
+            plt.title(f'Basisverteilung (Kategorisch): {feat} (N={n_videos})', fontsize=12, fontweight='bold')
+            plt.xlabel('')
+            plt.xticks(rotation=30, ha='right')
+            
+            # Schreibe die genaue Anzahl (n=...) über jeden Balken
+            for p in ax.patches:
+                n_count = int(p.get_height())
+                ax.annotate(f'n={n_count}', 
+                            (p.get_x() + p.get_width() / 2., p.get_height()),
+                            ha='center', va='bottom', fontsize=10, 
+                            color='black', xytext=(0, 3), textcoords='offset points')
+
+        # Gemeinsame Formatierung für beide Diagrammtypen
+        plt.ylabel('Anzahl der Videos', fontsize=10)
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        # Y-Achse etwas höher setzen, damit die 'n=' Labels nicht abgeschnitten werden
+        ymin, ymax = plt.ylim()
+        plt.ylim(ymin, ymax * 1.15)
+        
+        plt.tight_layout()
+        file_path = os.path.join(target_folder, f'Dist_{feat}.png')
+        plt.savefig(file_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f" -> Verteilungs-Plot für '{feat}' gespeichert.")
+
+    print("=== Baseline Analysis abgeschlossen. ===\n")
+
 def calculate_metrics(y_true, y_pred, y_prob=None):
     if len(y_true) == 0:
         return {'Accuracy (%)': 0, 'Precision (%)': 0, 'Recall (%)': 0, 'F1-Score (%)': 0, 'ROC AUC': 'N/A', 'TN': 0, 'FP': 0, 'FN': 0, 'TP': 0}
@@ -187,7 +310,7 @@ def get_plot_label(model_name):
 # ---------------------------------------------------------
 
 def run_analysis(suffix=""):
-    output_datei = f'results{suffix}.xlsx'
+    output_datei = os.path.join(RESULTS_FOLDER, f'results{suffix}.xlsx')
     print(f"--- JSON Extraktion für {suffix} ---")
     json_files = glob.glob(os.path.join(JSON_FOLDER, f'*{suffix}.json'))
     
@@ -203,7 +326,8 @@ def run_analysis(suffix=""):
             if 'justification' in df_t.columns:
                 df_t['justification_length'] = df_t['justification'].apply(get_word_count)
             all_data.append(df_t)
-        except: pass
+        except Exception as e:
+            print(f" [WARN] Fehler beim Laden von {file_path}: {e}")
 
     if not all_data: return
 
@@ -225,7 +349,7 @@ def run_aggregation_and_benchmark():
     # 1. Daten laden
     for suffix in RUN_SUFFIXES:
         try:
-            df = pd.read_excel(f'results{suffix}.xlsx')
+            df = pd.read_excel(os.path.join(RESULTS_FOLDER, f'results{suffix}.xlsx'))
             
             # Base Model erstellen (für Merge Key)
             df['base_model'] = df['model'].str.replace(rf'{suffix}$', '', regex=True)
@@ -257,10 +381,11 @@ def run_aggregation_and_benchmark():
         df_info = pd.read_excel(INFO_DATEI)
         df_info['video_id'] = df_info['video_id'].astype(str)
         df_final = pd.merge(df_final, df_info, on='video_id', how='left')
-        
+
         if 'deepfake' in df_final.columns:
             df_final['y_true'] = df_final['deepfake'].map({"Real": 0, "real": 0, "Fake": 1, "fake": 1, 0: 0, 1: 1})
-    except: pass
+    except Exception as e:
+        print(f" [WARN] Ground Truth konnte nicht geladen werden: {e}")
     
     # Speichern
     df_final.to_excel(SUMMARIZED_FILE, index=False)
@@ -317,14 +442,14 @@ def run_aggregation_and_benchmark():
     # A) Detailed Report
     cols_order = ['Model', 'Display_Name', 'Type', 'Threshold', 'Accuracy (%)', 'F1-Score (%)', 'Videos']
     cols_order = [c for c in cols_order if c in df_metrics.columns] + [c for c in df_metrics.columns if c not in cols_order]
-    df_metrics[cols_order].to_excel('benchmark_detailed_runs.xlsx', index=False)
+    df_metrics[cols_order].to_excel(os.path.join(RESULTS_FOLDER, 'benchmark_detailed_runs.xlsx'), index=False)
     print(" benchmark_detailed_runs.xlsx erstellt.")
 
     # B) Scientific Report & LaTeX Generierung
     metric_cols = ['Accuracy (%)', 'Precision (%)', 'Recall (%)', 'F1-Score (%)', 'ROC AUC']
     metric_cols = [c for c in metric_cols if c in df_metrics.columns]
     
-    with pd.ExcelWriter('benchmark_scientific_report.xlsx') as writer:
+    with pd.ExcelWriter(os.path.join(RESULTS_FOLDER, 'benchmark_scientific_report.xlsx')) as writer:
         for threshold in thresholds:
             # 1. Daten filtern für aktuellen Threshold
             sub_df = df_metrics[df_metrics['Threshold'] == threshold]
@@ -375,7 +500,7 @@ def run_aggregation_and_benchmark():
             latex_df.rename(columns={latex_df.columns[0]: 'Base Model'}, inplace=True)
 
             # Speichere die .tex Datei
-            filename = f'benchmark_results_{threshold}.tex'
+            filename = os.path.join(RESULTS_FOLDER, f'benchmark_results_{threshold}.tex')
             col_format = 'l' + 'c' * (len(latex_df.columns) - 1)
             latex_df.to_latex(filename, escape=False, index=False, column_format=col_format)
             print(f" LaTeX-Datei für Threshold {threshold} erstellt: {filename}")
@@ -473,20 +598,27 @@ def load_master_data():
     df = pd.read_excel(SUMMARIZED_FILE)
     df['video_id'] = df['video_id'].astype(str)
 
-    # Check ob Metadaten schon da sind, sonst nachladen
-    if not all(col in df.columns for col in META_COLS):
-        print("Merged Metadaten (dataset_info)...")
-        if os.path.exists(INFO_DATEI):
-            df_info = pd.read_excel(INFO_DATEI)
-            df_info['video_id'] = df_info['video_id'].astype(str)
-            # Left join um Datenverlust zu vermeiden
-            df = pd.merge(df, df_info, on='video_id', how='left', suffixes=('', '_info'))
-            
-            # Falls y_true fehlte, füllen
-            if 'y_true' not in df.columns and 'deepfake' in df.columns:
-                 df['y_true'] = df['deepfake'].map({"Real": 0, "real": 0, "Fake": 1, "fake": 1, 0: 0, 1: 1})
+    if os.path.exists(INFO_DATEI):
+        df_info = pd.read_excel(INFO_DATEI)
+        df_info['video_id'] = df_info['video_id'].astype(str)
+
+        # Nur Spalten aus df_info nehmen, die in df noch fehlen (außer dem Join-Key)
+        new_cols = [c for c in df_info.columns
+                    if c != 'video_id' and c not in df.columns]
+
+        if new_cols:
+            print(f" -> Merge Metadaten aus {INFO_DATEI}: {new_cols}")
+            df = pd.merge(df, df_info[['video_id'] + new_cols],
+                          on='video_id', how='left')
         else:
-            print(f"Warnung: {INFO_DATEI} fehlt! Analysen werden unvollständig sein.")
+            print(f" -> Alle Metadaten bereits vorhanden, kein Merge nötig.")
+
+        if 'y_true' not in df.columns and 'deepfake' in df.columns:
+            df['y_true'] = df['deepfake'].map(
+                {"Real": 0, "real": 0, "Fake": 1, "fake": 1, 0: 0, 1: 1}
+            )
+    else:
+        print(f"Warnung: {INFO_DATEI} fehlt! Analysen werden unvollständig sein.")
 
     print(f"Daten geladen: {len(df)} Zeilen, {len(df.columns)} Spalten.")
     return df
@@ -579,7 +711,7 @@ def run_global_baseline_roc_analysis(df_master):
     plt.plot([0, 1], [0, 1], color='gray', lw=1, linestyle='--', label='Random Guessing (AUC = 0.5)')
     
     # Ordner für aggregierte Plots sicherstellen
-    agg_folder = os.path.join(base_plot_folder, 'Aggregated_Analysis')
+    agg_folder = os.path.join(base_plot_folder, 'Aggregated')
     os.makedirs(agg_folder, exist_ok=True)
 
     has_data = False
@@ -713,106 +845,127 @@ def run_family_variant_roc_comparison(df_master):
             print(f" -> Keine validen Daten für Familie {fam} gefunden.")
 
 def run_feature_importance_analysis(df_master):
-    print("\n=== Feature Importance (Per Run) ===")
-    
+    """
+    Ersetzt Random Forest Feature Importance (nicht valide bei N=50) durch:
+    - Normalized Stacked Bar Chart für kategorische Features
+    - Swarmplot für numerische Features (z.B. video_length)
+    Jeweils ein Facet-Grid über alle Baseline-Modelle pro Feature.
+    """
+    print("\n=== Feature Importance (Stacked Bar + Swarm, Per Run & Feature) ===")
+
+    # Nur Baseline-Modelle (keine +I / +T Varianten)
+    baseline_keys = [k for k in BASE_MODEL_DISPLAY_NAMES
+                     if '_indicators' not in k and '_thinking' not in k]
+
     for run_label, df_run in iterate_runs(df_master):
+        print(f" -> {run_label}...")
+
         save_dir = os.path.join(base_plot_folder, run_label, 'Feature_Importance')
         os.makedirs(save_dir, exist_ok=True)
-        
-        print(f"{run_label}...")
-        
-        for model_name, group in df_run.groupby('base_model'):
-            sub_df = group.copy()
-            if len(sub_df) < 10: continue
-            
-            sub_df['error'] = (sub_df['y_pred'] != sub_df['y_true']).astype(int)
-            if sub_df['error'].nunique() < 2: continue
 
-            meta_cols = [c for c in META_COLS if c in sub_df.columns]
-            if not meta_cols:
+        df_run = df_run[df_run['base_model'].isin(baseline_keys)].copy()
+        df_run['correct'] = (df_run['y_pred'] == df_run['y_true']).astype(int)
+        df_run['Outcome'] = df_run['correct'].map({1: 'Korrekt', 0: 'Fehler'})
+        df_run['Model'] = df_run['base_model'].apply(get_plot_label)
+
+        if df_run.empty:
+            print(f"    Keine Baseline-Daten für {run_label}.")
+            continue
+
+        models_ordered = sorted(df_run['Model'].unique())
+        n_models = len(models_ordered)
+
+        for feat in META_COLS:
+            if feat not in df_run.columns:
                 continue
 
-            try:
-                X_raw = sub_df[meta_cols]
-                X = pd.get_dummies(X_raw, dummy_na=True).fillna(0)
+            is_numeric = pd.api.types.is_numeric_dtype(df_run[feat])
 
-                clf = RandomForestClassifier(
-                    n_estimators=200,
-                    max_depth=5,
-                    class_weight="balanced",
-                    random_state=42,
-                )
-                clf.fit(X, sub_df["error"])
+            if is_numeric:
+                # ── SWARMPLOT (Strip + Box) ──────────────────────────────────
+                fig, axes = plt.subplots(1, n_models, figsize=(4 * n_models, 5), sharey=True)
+                if n_models == 1:
+                    axes = [axes]
 
-                fi = (
-                    pd.DataFrame(
-                        {"Feature": X.columns, "Importance": clf.feature_importances_}
-                    )
-                    .sort_values("Importance", ascending=False)
-                    .head(10)
-                )
+                for ax, model in zip(axes, models_ordered):
+                    sub = df_run[df_run['Model'] == model].dropna(subset=[feat])
+                    palette = {'Korrekt': '#2ca02c', 'Fehler': '#d62728'}
 
-                plt.figure(figsize=(8, 6))
-                sns.barplot(data=fi, x="Importance", y="Feature")
-                plot_label = get_plot_label(model_name)
-                plt.title(f"Error Drivers: {plot_label}")
+                    # ---> NEU: order=['Korrekt', 'Fehler'] erzwingt einheitliche X-Achse <---
+                    sns.boxplot(data=sub, x='Outcome', y=feat, ax=ax,
+                                palette=palette, width=0.4, order=['Korrekt', 'Fehler'],
+                                showfliers=False, linewidth=1.2)
+                    sns.stripplot(data=sub, x='Outcome', y=feat, ax=ax,
+                                  palette=palette, size=4, alpha=0.7, jitter=True,
+                                  order=['Korrekt', 'Fehler'])
+
+                    ax.set_title(model, fontsize=10, fontweight='bold')
+                    ax.set_xlabel('')
+                    if ax == axes[0]:
+                        ax.set_ylabel(feat, fontsize=10)
+                    else:
+                        ax.set_ylabel('')
+
+                fig.suptitle(f'{run_label} – Verteilung „{feat}" nach Klassifikationsergebnis',
+                             fontsize=12, fontweight='bold')
                 plt.tight_layout()
-
-                safe_name = re.sub(r"[^\w\-_\. ]", "_", str(model_name))
-                plt.savefig(os.path.join(save_dir, f"FI_{safe_name}.png"), dpi=200)
+                plt.savefig(os.path.join(save_dir, f'Swarm_{feat}.png'), dpi=300, bbox_inches='tight')
                 plt.close()
 
-            except Exception as e:
-                print(f"[WARN] {run_label} | {model_name}: {e}")
-                continue
-
-def run_standard_correlation_analysis(df_master):
-    print("\n=== Correlation Analysis (Per Run) ===")
-    
-    for run_label, df_run in iterate_runs(df_master):
-        run_folder = os.path.join(base_plot_folder, run_label)
-        os.makedirs(run_folder, exist_ok=True)
-        
-        # Zielvariable: Error (1 = Falsch, 0 = Richtig)
-        y = (df_run['y_pred'] != df_run['y_true']).astype(int)
-        
-
-        df_analysis = pd.DataFrame({'error': y})
-        
-        for col in META_COLS:
-            if col not in df_run.columns:
-                continue
-            
-            # Prüfen: Ist die Spalte numerisch?
-            if pd.api.types.is_numeric_dtype(df_run[col]):
-                df_analysis[col] = df_run[col]
             else:
-                # Kategorisch (z.B. gender, dataset): One-Hot-Encoding
-                # drop_first=True verhindert Redundanz (z.B. nur 'gender_male', nicht 'gender_female')
-                dummies = pd.get_dummies(df_run[col], prefix=col, drop_first=True)
-                df_analysis = pd.concat([df_analysis, dummies], axis=1)
+                # ── NORMALIZED STACKED BAR CHART ────────────────────────────
+                fig, axes = plt.subplots(1, n_models, figsize=(3.5 * n_models, 5), sharey=True)
+                if n_models == 1:
+                    axes = [axes]
 
-        # Korrelation berechnen & Plotten
-        if df_analysis.shape[1] > 1:
-            # Korrelation aller Spalten zur Spalte 'error'
-            corr = df_analysis.corr()['error'].drop('error').sort_values()
-            
-            plt.figure(figsize=(10, 8))
-        
-            # Farben: Rot = Verursacht Fehler (Positive Corr), Blau = Verhindert Fehler (Negative Corr)
-            colors = ['#4e79a7' if x < 0 else '#e15759' for x in corr.values]
-            
-            corr.plot(kind='barh', color=colors)
-            
-            plt.title(f'Feature Correlation with Prediction Error ({run_label.replace("_", " ")})')
-            plt.xlabel("Correlation Coefficient (Pearson)")
-            plt.axvline(0, color='black', linewidth=0.8) # Nulllinie zur Orientierung
-            plt.grid(axis='x', linestyle='--', alpha=0.7)
-            plt.tight_layout()
-            
-            plt.savefig(os.path.join(run_folder, 'Correlation_BarChart.png'))
-            plt.close()
-            print(f" -> Plot für {run_label} erstellt (nur META_COLS).")
+                for ax, model in zip(axes, models_ordered):
+                    sub = df_run[df_run['Model'] == model].dropna(subset=[feat])
+
+                    # Normalisierte Anteile pro Gruppe berechnen
+                    counts = (sub.groupby([feat, 'Outcome'], observed=False)
+                                .size()
+                                .unstack(fill_value=0))
+
+                    # Sicherstellen, dass beide Spalten vorhanden sind
+                    for col in ['Korrekt', 'Fehler']:
+                        if col not in counts.columns:
+                            counts[col] = 0
+
+                    counts_pct = counts.div(counts.sum(axis=1), axis=0) * 100
+                    counts_pct = counts_pct[['Korrekt', 'Fehler']]
+
+                    counts_pct.plot(
+                        kind='bar', stacked=True, ax=ax,
+                        color=['#2ca02c', '#d62728'],
+                        edgecolor='white', linewidth=0.5,
+                        legend=(ax == axes[-1])
+                    )
+
+                    # N pro Gruppe als Annotation
+                    for i, (_, row) in enumerate(counts.iterrows()):
+                        n_total = int(row.sum())
+                        ax.text(i, 101, f'n={n_total}', ha='center', va='bottom',
+                                fontsize=7, color='gray')
+
+                    ax.set_title(model, fontsize=10, fontweight='bold')
+                    ax.set_xlabel('')
+                    ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right', fontsize=8)
+                    ax.set_ylim(0, 115)
+                    if ax == axes[0]:
+                        ax.set_ylabel('Anteil (%)', fontsize=10)
+                    else:
+                        ax.set_ylabel('')
+                    ax.axhline(50, color='gray', linewidth=0.8, linestyle='--', alpha=0.6)
+
+                    if ax == axes[-1]:
+                        ax.legend(loc='upper right', fontsize=8, title='Ergebnis')
+
+                fig.suptitle(f'{run_label} – Klassifikationsergebnis nach „{feat}"',
+                             fontsize=12, fontweight='bold')
+                plt.tight_layout()
+                plt.savefig(os.path.join(save_dir, f'StackedBar_{feat}.png'), dpi=300, bbox_inches='tight')
+                plt.close()
+
 
 def run_feature_analysis(df_master):
     print("\n=== Feature Analysis (Per Run) ===")
@@ -835,7 +988,7 @@ def run_feature_analysis(df_master):
     if all_results:
         df_res = pd.DataFrame(all_results)
         df_res = df_res.sort_values(['Run', 'Display_Name', 'Feature'])
-        df_res.to_excel('feature_analysis.xlsx', index=False)
+        df_res.to_excel(os.path.join(RESULTS_FOLDER, 'feature_analysis.xlsx'), index=False)
         
         # Heatmaps
         for run_label in df_res['Run'].unique():
@@ -898,7 +1051,8 @@ def run_feature_analysis(df_master):
                         plt.tight_layout()
                         plt.savefig(os.path.join(run_folder, f'Feature_Analysis_{feat}_Heatmap.png'))
                         plt.close()
-                except: pass
+                except Exception as e:
+                    print(f" [WARN] Feature-Plot für '{feat}' fehlgeschlagen: {e}")
 
 def run_fairness_analysis(df_master):
     print("\n=== Fairness Analysis (Per Run) ===")
@@ -934,7 +1088,7 @@ def run_fairness_analysis(df_master):
 
     if all_results:
         df_res = pd.DataFrame(all_results).sort_values(['Run', 'Display_Name', 'P-Value'])
-        df_res.to_excel('fairness_analysis.xlsx', index=False)
+        df_res.to_excel(os.path.join(RESULTS_FOLDER, 'fairness_analysis.xlsx'), index=False)
         
         # Heatmaps (Bias)
         for run_label in df_res['Run'].unique():
@@ -953,7 +1107,8 @@ def run_fairness_analysis(df_master):
                     plt.tight_layout()
                     plt.savefig(os.path.join(run_folder, f'Fairness_Bias_{feat}.png'))
                     plt.close()
-                except: pass
+                except Exception as e:
+                    print(f" [WARN] Fairness-Plot für '{feat}' fehlgeschlagen: {e}")
 
 
 
@@ -989,7 +1144,7 @@ def run_intra_model_consistency_check(df_master):
         for col in justification_cols:
             texts = group[col].astype(str).tolist()
             # show_progress_bar=False hält den Konsolen-Output sauberer
-            emb = model_sbert.encode(texts, convert_to_tensor=True, show_progress_bar=False)
+            emb = get_sbert().encode(texts, convert_to_tensor=True, show_progress_bar=False)
             embeddings.append(emb)
         
         # B) Paarweise Ähnlichkeiten berechnen
@@ -1019,11 +1174,11 @@ def run_intra_model_consistency_check(df_master):
 
     # Excel Speichern
     df_res = pd.DataFrame(results)
-    df_res.to_excel('consistency_analysis_intra_model_raw.xlsx', index=False)
+    df_res.to_excel(os.path.join(RESULTS_FOLDER, 'consistency_analysis_intra_model_raw.xlsx'), index=False)
     
     # Aggregation berechnen
     summary = df_res.groupby('base_model')['Consistency_Score'].agg(['mean', 'std']).sort_values('mean', ascending=False)
-    summary.reset_index().to_excel('consistency_summary_per_model.xlsx', index=False)
+    summary.reset_index().to_excel(os.path.join(RESULTS_FOLDER, 'consistency_summary_per_model.xlsx'), index=False)
     print("\n--- Summary ---")
     print(summary)
 
@@ -1059,10 +1214,14 @@ def run_intra_model_consistency_check(df_master):
     
     print("Consistency Plots (Boxplot & BarChart) gespeichert.")
 
+
+
+
 def analyze_region_coverage(df):
     """
-    Zeigt, wie oft Audio, Body und Background in den Justifications vorkommen.
-    Hilft zu entscheiden, ob diese Kategorien weiter unterteilt werden sollten.
+    Prüft für jede Anker-Region aus KEYWORD_ANCHORS, wie oft sie in den
+    Justifications vorkommt, und zeigt welche häufigen Keywords noch nicht
+    abgedeckt sind (Kandidaten zum Ergänzen der Anker).
     """
     justification_cols = [f'justification{s}' for s in RUN_SUFFIXES]
     justification_cols = [c for c in justification_cols if c in df.columns]
@@ -1075,32 +1234,55 @@ def analyze_region_coverage(df):
     ).str.lower()
     total = len(all_texts)
 
-    REGION_PATTERNS = {
-        'Audio – Voice/Speech':  r'voice|speech|pronunciation|accent|audio',
-        'Audio – Lip Sync':      r'lip.?sync|synchroni|mouth movement',
-        'Body – Head/Neck':      r'\bneck\b|\bhead\b',
-        'Body – Shoulders/Torso':r'shoulder|torso|chest|body',
-        'Body – Hands':          r'\bhand\b|\bhands\b|\bfinger',
-        'Background – Lighting': r'lighting|illuminat|shadow|light source|brightness',
-        'Background – Scene':    r'\bscene\b|background|environment|setting',
-        'Background – Temporal': r'flicker|temporal|inconsisten|over time|frame.to.frame',
+    # Aus KEYWORD_ANCHORS ein Regex-Pattern pro Region bauen
+    # Anker-Text z.B. "skin, cheek, forehead" → r'skin|cheek|forehead'
+    region_patterns = {
+        region: '|'.join(re.escape(t.strip()) for t in anchor_text.split(','))
+        for region, anchor_text in KEYWORD_ANCHORS.items()
     }
 
     print("\n=== Region Coverage in Justifications ===")
     print(f"Gesamt-Justifications: {total}\n")
 
     results = []
-    for label, pattern in REGION_PATTERNS.items():
+    for region, pattern in region_patterns.items():
+        l2, l1 = KEYWORD_HIERARCHY.get(region, ('?', '?'))
         count = all_texts.str.contains(pattern, regex=True).sum()
         pct   = round(count / total * 100, 1)
-        results.append({'Kategorie': label, 'Treffer': count, 'Anteil (%)': pct})
-        print(f"  {label:<35} {count:>5}x  ({pct}%)")
+        results.append({'Region (L3)': region, 'L2': l2, 'L1': l1,
+                        'Treffer': count, 'Anteil (%)': pct})
+        print(f"  [{l1:6} › {l2:12}] {region:<18} {count:>5}x  ({pct}%)")
 
-    df_res = pd.DataFrame(results)
-    save_path = os.path.join(base_plot_folder, 'region_coverage.xlsx')
-    df_res.to_excel(save_path, index=False)
-    print(f"\n -> Ergebnisse gespeichert: {save_path}")
-    print("\nEmpfehlung: Kategorien mit < 5% sind für eine Unterteilung meist zu dünn besetzt.")
+    df_res = pd.DataFrame(results).sort_values('Anteil (%)', ascending=False)
+
+    # Nicht abgedeckte häufige Keywords finden
+    combined_pattern = '|'.join(f'(?:{p})' for p in region_patterns.values())
+    cv = CountVectorizer(ngram_range=(1, 2), stop_words=DOMAIN_STOPS, min_df=5, max_features=500)
+    try:
+        mat = cv.fit_transform(all_texts)
+        kw_counts = pd.DataFrame({
+            'keyword': cv.get_feature_names_out(),
+            'count':   mat.sum(axis=0).A1
+        }).sort_values('count', ascending=False)
+
+        kw_counts['covered'] = kw_counts['keyword'].str.contains(combined_pattern, regex=True)
+        uncovered = kw_counts[~kw_counts['covered']].head(40)
+        uncovered['Anteil (%)'] = (uncovered['count'] / total * 100).round(1)
+
+        print("\n--- Top-40 nicht abgedeckte häufige Keywords ---")
+        print("(Kandidaten für neue Anker in KEYWORD_ANCHORS)\n")
+        for _, row in uncovered.iterrows():
+            print(f"  {row['keyword']:<35} {int(row['count']):>5}x  ({row['Anteil (%)']}%)")
+
+        save_path = os.path.join(RESULTS_FOLDER, 'region_coverage.xlsx')
+        with pd.ExcelWriter(save_path) as writer:
+            df_res.to_excel(writer, sheet_name='Coverage', index=False)
+            uncovered.to_excel(writer, sheet_name='Uncovered_Keywords', index=False)
+        print(f"\n -> Ergebnisse gespeichert: {save_path}")
+    except ValueError:
+        save_path = os.path.join(RESULTS_FOLDER, 'region_coverage.xlsx')
+        df_res.to_excel(save_path, index=False)
+
     return df_res
 
 
@@ -1134,7 +1316,7 @@ def export_keyword_inventory(df):
         'count': counts.sum(axis=0).A1
     }).sort_values(by='count', ascending=False)
     
-    save_path = os.path.join(base_plot_folder, 'keyword_inventory.xlsx')
+    save_path = os.path.join(RESULTS_FOLDER, 'keyword_inventory.xlsx')
     inventory.to_excel(save_path, index=False)
     print(f"Inventar gespeichert: keyword_inventory.xlsx (Basierend auf {len(justification_cols)} Runs)")
     return inventory
@@ -1156,66 +1338,13 @@ def cluster_keywords(inventory_df, output_filename='keyword_inventory_clustered.
     """
     print(" -> Starte SBERT-Clustering")
 
-    model = model_sbert
+    model = get_sbert()
 
-    # Level-3-Anker: SBERT ordnet jedes Keyword einem dieser Begriffe zu
-    ANCHORS = {
-        # MARE Gesichtsregionen
-        'Skin':          'skin, cheek, forehead, complexion, dermal',
-        'Nose':          'nose, nostril, nasal',
-        'Mouth':         'mouth, lip, lips',
-        'Teeth':         'tooth, teeth',
-        'Left_Eye':      'left eye, left-eye, lefteye, eye, ocular',
-        'Right_Eye':     'right eye, right-eye, righteye, eye, ocular',
-        'Left_Eyebrow':  'left eyebrow, left brow, eyebrow, brow',
-        'Right_Eyebrow': 'right eyebrow, right brow, eyebrow, brow',
-        'Chin':          'chin, jaw, jawline, lower face',
-        'Beard':         'beard, mustache, moustache, goatee',
-        'Hairline':      'hairline, hair line, hair',
-        'Ear':           'ear, ears',
-        # Body
-        'Head_Neck':     'neck, head, throat',
-        'Torso':         'shoulder, torso, chest, arm, posture',
-        'Hands':         'hand, hands, finger, fingers',
-        # Background
-        'Lighting':      'lighting, illumination, shadow, brightness, light source',
-        'Scene':         'scene, background, environment, setting',
-        'Temporal':      'flickering, temporal, inconsistency, frame rate, over time',
-        # Audio
-        'Voice':         'voice, speech, pronunciation, accent, audio, sound, tone',
-        'Lip_Sync':      'lip sync, synchronization, mouth movement, lipsync',
-    }
-
-    # Statische Hierarchie: Level 3 → (Level 2, Level 1)
-    REGION_HIERARCHY = {
-        'Skin':            ('Face',       'Frame'),
-        'Nose':            ('Face',       'Frame'),
-        'Mouth':           ('Face',       'Frame'),
-        'Teeth':           ('Face',       'Frame'),
-        'Left_Eye':        ('Face',       'Frame'),
-        'Right_Eye':       ('Face',       'Frame'),
-        'Left_Eyebrow':    ('Face',       'Frame'),
-        'Right_Eyebrow':   ('Face',       'Frame'),
-        'Chin':            ('Face',       'Frame'),
-        'Beard':           ('Face',       'Frame'),
-        'Hairline':        ('Face',       'Frame'),
-        'Ear':             ('Face',       'Frame'),
-        'Head_Neck':       ('Body',       'Frame'),
-        'Torso':           ('Body',       'Frame'),
-        'Hands':           ('Body',       'Frame'),
-        'Lighting':        ('Background', 'Frame'),
-        'Scene':           ('Background', 'Frame'),
-        'Temporal':        ('Background', 'Frame'),
-        'Voice':           ('Audio',      'Audio'),
-        'Lip_Sync':        ('Audio',      'Audio'),
-        'Audio':           ('Audio',      'Audio'),
-        'Other/Technical': ('Background', 'Frame'),
-    }
-
+    # Globale KEYWORD_ANCHORS und KEYWORD_HIERARCHY verwenden
     df = inventory_df.copy()
 
-    region_names = list(ANCHORS.keys())
-    anchor_texts = list(ANCHORS.values())
+    region_names = list(KEYWORD_ANCHORS.keys())
+    anchor_texts = list(KEYWORD_ANCHORS.values())
 
     # Embeddings & Cosine Similarity
     region_embeddings  = model.encode(anchor_texts, convert_to_tensor=True)
@@ -1230,16 +1359,16 @@ def cluster_keywords(inventory_df, output_filename='keyword_inventory_clustered.
     df['level_3']    = [region_names[i] for i in best_indices]
     df['confidence'] = confidences
 
-    # Zu unsichere Zuweisungen → Other/Technical
-    df.loc[df['confidence'] < 0.4, 'level_3'] = 'Other/Technical'
+    # Zu unsichere Zuweisungen → 'General Artifacts'
+    df.loc[df['confidence'] < 0.4, 'level_3'] = 'General_Artifacts'
 
     # Level 2 und Level 1 aus statischer Hierarchie ableiten
     # Fallback: Background/Frame für unbekannte Werte
     df['level_2'] = df['level_3'].map(
-        lambda r: REGION_HIERARCHY.get(r, ('Background', 'Frame'))[0]
+        lambda r: KEYWORD_HIERARCHY.get(r, ('Background', 'Frame'))[0]
     )
     df['level_1'] = df['level_3'].map(
-        lambda r: REGION_HIERARCHY.get(r, ('Background', 'Frame'))[1]
+        lambda r: KEYWORD_HIERARCHY.get(r, ('Background', 'Frame'))[1]
     )
 
     # Debug: Grenzfälle mit allen Scores speichern
@@ -1253,7 +1382,7 @@ def cluster_keywords(inventory_df, output_filename='keyword_inventory_clustered.
     scores_df['confidence'] = confidences
     ambiguous = scores_df[scores_df['confidence'] < 0.5].reset_index()
     if not ambiguous.empty:
-        debug_path = os.path.join(base_plot_folder, 'debug_ambiguous_keywords.xlsx')
+        debug_path = os.path.join(RESULTS_FOLDER, 'debug_ambiguous_keywords.xlsx')
         ambiguous.to_excel(debug_path, index=False)
         print(f" -> {len(ambiguous)} mehrdeutige Keywords gespeichert: {debug_path}")
 
@@ -1262,7 +1391,7 @@ def cluster_keywords(inventory_df, output_filename='keyword_inventory_clustered.
         by=['level_1', 'level_2', 'level_3', 'confidence'],
         ascending=[True, True, True, False]
     )
-    save_path = os.path.join(base_plot_folder, output_filename)
+    save_path = os.path.join(RESULTS_FOLDER, output_filename)
     df.to_excel(save_path, index=False)
 
     print(f"Keyword-Clustering abgeschlossen. Datei gespeichert: {save_path}")
@@ -1270,40 +1399,60 @@ def cluster_keywords(inventory_df, output_filename='keyword_inventory_clustered.
 
 # --- MODUL 2: KEYWORD-PLOTS MIT HIERARCHIE & TP/FP-FARBEN ---
 
-def _extract_keyword_counts(texts, max_features=100):
-    """Extrahiert 1-3-Gramm Keywords und Häufigkeiten aus einer Textliste."""
-    if not texts or len(texts) < 3:
-        return pd.DataFrame(columns=['keyword', 'count'])
+def _build_shared_vectorizer(groups: dict, max_features=150):
+    """
+    Fittet einen gemeinsamen CountVectorizer, Vocabulary-Selektion auf TP+FP.
+    TP und FP sind analytisch am relevantesten — ihre Keywords dominieren die Auswahl.
+    FN und TN werden danach mit derselben Vocabulary transformiert.
+    """
+    # Vocabulary auf TP+FP fitten (wichtigste Gruppen für die Analyse)
+    fit_texts = groups.get('TP', []) + groups.get('FP', [])
+    if not fit_texts:
+        # Fallback: alle Texte verwenden
+        fit_texts = [t for texts in groups.values() for t in texts]
+    if not fit_texts:
+        return None, {}
     cv = CountVectorizer(ngram_range=(1, 3), stop_words=DOMAIN_STOPS, max_features=max_features)
     try:
-        mat = cv.fit_transform(texts)
-        return pd.DataFrame({'keyword': cv.get_feature_names_out(), 'count': mat.sum(axis=0).A1})
+        cv.fit(fit_texts)
     except ValueError:
+        return None, {}
+    matrices = {}
+    for name, texts in groups.items():
+        if texts:
+            matrices[name] = cv.transform(texts)
+        else:
+            matrices[name] = None
+    return cv, matrices
+
+
+def _counts_from_matrix(mat, cv, n_texts, normalize=False):
+    """Summiert eine sparse Matrix zu einem keyword→count DataFrame."""
+    if mat is None or n_texts == 0:
         return pd.DataFrame(columns=['keyword', 'count'])
+    counts = mat.sum(axis=0).A1
+    if normalize:
+        counts = counts / n_texts
+    return pd.DataFrame({'keyword': cv.get_feature_names_out(), 'count': counts})
 
 
-def _plot_tp_fp_bars(df_data, x_col, title, filename, save_folder):
-    """Horizontaler Balkenplot: TP (grün) und FP (rot) nebeneinander."""
-    if df_data.empty:
-        return
-    df_melted = df_data.melt(
-        id_vars=[x_col], value_vars=['TP', 'FP'],
-        var_name='Type', value_name='Count'
-    )
-    height = max(4, len(df_data) * 0.6 + 1)
-    plt.figure(figsize=(10, height))
-    sns.barplot(
-        data=df_melted, x='Count', y=x_col, hue='Type',
-        palette={'TP': '#2ca25f', 'FP': '#de2d26'},
-        orient='h'
-    )
-    plt.title(title, fontsize=11)
-    plt.xlabel("Häufigkeit")
-    plt.ylabel("")
-    plt.legend(title="")
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_folder, filename), dpi=200)
-    plt.close()
+def _build_lookup(clustered_df):
+    """Baut eine keyword→level_3/level_2/level_1 Lookup-Tabelle aus clustered_df."""
+    lookup = clustered_df[['keyword', 'level_3']].drop_duplicates('keyword').copy()
+    lookup['level_2'] = lookup['level_3'].map(lambda r: KEYWORD_HIERARCHY.get(r, ('Background', 'Frame'))[0])
+    lookup['level_1'] = lookup['level_3'].map(lambda r: KEYWORD_HIERARCHY.get(r, ('Background', 'Frame'))[1])
+    return lookup
+
+
+def _extract_texts(model_df):
+    """Extrahiert TP/FP/FN/TN-Justification-Listen aus einem Modell-DataFrame."""
+    masks = {
+        'TP': (model_df['y_true'] == 1) & (model_df['y_pred'] == 1),
+        'FP': (model_df['y_true'] == 0) & (model_df['y_pred'] == 1),
+        'FN': (model_df['y_true'] == 1) & (model_df['y_pred'] == 0),
+        'TN': (model_df['y_true'] == 0) & (model_df['y_pred'] == 0),
+    }
+    return {k: model_df[m]['justification'].dropna().tolist() for k, m in masks.items()}
 
 
 def plot_treemap_keywords(df_kw, model_name, run_label, save_folder):
@@ -1311,16 +1460,17 @@ def plot_treemap_keywords(df_kw, model_name, run_label, save_folder):
     Interaktive Treemap (HTML) + statisches PNG.
     Fläche = Gesamthäufigkeit, Farbe = TP-Anteil (grün = TP-dominiert, rot = FP-dominiert).
     """
-    if not PLOTLY_AVAILABLE:
-        return
 
     df = df_kw[df_kw['keyword'].str.split().str.len() >= 2].copy()
-    df['total'] = df['TP'] + df['FP']
+    count_cols = [c for c in ['TP', 'FP', 'FN', 'TN'] if c in df.columns]
+    df['total'] = df[count_cols].sum(axis=1)
     df = df[df['total'] > 0]
     if df.empty:
         return
 
-    df['tp_ratio'] = df['TP'] / df['total']
+    # tp_ratio: TP-Anteil an TP+FP (Präzisions-Proxy; TN/FN bewusst ausgeschlossen)
+    tp_fp = df.get('TP', 0) + df.get('FP', 0)
+    df['tp_ratio'] = df['TP'] / tp_fp.replace(0, float('nan'))
     plot_label = get_plot_label(model_name)
     safe_name  = re.sub(r'[^\w\-_]', '_', model_name)
 
@@ -1351,6 +1501,56 @@ def plot_treemap_keywords(df_kw, model_name, run_label, save_folder):
         pass  # kaleido nicht installiert — nur HTML gespeichert
 
 
+def plot_grouped_rates(df_kw, group_col, model_name, run_label, save_folder, level_name, top_n=20):
+    """
+    Grouped Bar Chart mit unabhängigen normalisierten Raten (Erwähnungen pro Text).
+    Jede Gruppe (TP/FP/FN) hat einen eigenen Balken — kein gemeinsamer Nenner,
+    da TP/FP/FN-Pools unterschiedlich groß sind. Scientifically correct.
+
+    Interpretation: Ein langer FP-Balken bei 'Face' bedeutet, dass das Modell
+    Face-Keywords in FP-Texten häufiger erwähnt als in TP-Texten (pro Text).
+    """
+    cols = [c for c in ['TP', 'FP', 'FN', 'TN'] if c in df_kw.columns]
+    df = df_kw.groupby(group_col)[cols].sum().reset_index()
+    df['total'] = df[cols].sum(axis=1)
+    df = df[df['total'] > 0].nlargest(top_n, 'total').sort_values('total')
+
+    if df.empty:
+        return
+
+    plot_label = get_plot_label(model_name)
+    safe_name  = re.sub(r'[^\w\-_]', '_', model_name)
+    labels     = df[group_col].tolist()
+    n_groups   = len(cols)
+    bar_height = 0.25
+    palette    = {'TP': '#2ca25f', 'FP': '#de2d26', 'FN': '#f59b00', 'TN': '#6baed6'}
+
+    _, ax = plt.subplots(figsize=(10, max(4, len(df) * 0.7 + 1)))
+
+    global_max = df[cols].max().max()
+    y = range(len(labels))
+    for i, c in enumerate(cols):
+        offsets = [pos + (i - n_groups / 2 + 0.5) * bar_height for pos in y]
+        vals = df[c].values
+        bars = ax.barh(offsets, vals, height=bar_height, color=palette[c], label=c)
+        for bar, val in zip(bars, vals):
+            if val > 0:
+                ax.text(val + global_max * 0.01, bar.get_y() + bar.get_height() / 2,
+                        f'{val:.2f}', va='center', fontsize=7, color=palette[c])
+
+    ax.set_yticks(list(y))
+    ax.set_yticklabels(labels)
+    ax.set_xlabel('Erwähnungsrate (Nennungen pro Text, normalisiert)', fontsize=10)
+    ax.set_title(f"{plot_label} | {run_label} | {level_name}", fontsize=11)
+    ax.legend(loc='lower right')
+    ax.grid(axis='x', linestyle='--', alpha=0.3)
+    plt.tight_layout()
+
+    filename = f"{safe_name}_grouped_{level_name}_{run_label}.png"
+    plt.savefig(os.path.join(save_folder, filename), dpi=200)
+    plt.close()
+
+
 def plot_diverging_bars(df_kw, group_col, model_name, run_label, save_folder, level_name, top_n=20):
     """
     Diverging Bar Chart: TP-Balken nach rechts (grün), FP-Balken nach links (rot).
@@ -1377,12 +1577,13 @@ def plot_diverging_bars(df_kw, group_col, model_name, run_label, save_folder, le
     offset = max_val * 0.015
     for idx, row in enumerate(df.itertuples()):
         if row.TP > 0:
-            ax.text(row.TP + offset, idx, str(int(row.TP)),
+            ax.text(row.TP + offset, idx, f'{row.TP:.2f}',
                     va='center', fontsize=8, color='#2ca25f')
         if row.FP > 0:
-            ax.text(-row.FP - offset, idx, str(int(row.FP)),
+            ax.text(-row.FP - offset, idx, f'{row.FP:.2f}',
                     va='center', ha='right', fontsize=8, color='#de2d26')
 
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{abs(x):.2f}'))
     ax.set_xlabel('← FP  |  TP →', fontsize=10)
     ax.set_title(f"{plot_label} | {run_label} | {level_name}", fontsize=11)
     ax.legend(loc='lower right')
@@ -1394,126 +1595,350 @@ def plot_diverging_bars(df_kw, group_col, model_name, run_label, save_folder, le
     plt.close()
 
 
-def plot_keywords_hierarchical(tp_texts, fp_texts, model_name, run_label, save_folder, clustered_df):
+def plot_keywords_hierarchical(groups, model_name, run_label, save_folder, clustered_df):
     """
-    Erstellt Keyword-Plots auf allen 3 Hierarchie-Ebenen mit TP (grün) und FP (rot).
-    Level 3: Top-Keywords (2+ Wörter), Level 2: nach Region aggregiert, Level 1: nach Modalität.
+    Erstellt Keyword-Plots auf allen Hierarchie-Ebenen mit TP/FP/FN/TN.
+    groups: Dict {'TP': [...], 'FP': [...], 'FN': [...], 'TN': [...]}
+    Rates sind normalisiert (Erwähnungen pro Text) für Vergleichbarkeit.
     """
-    tp_kw = _extract_keyword_counts(tp_texts).rename(columns={'count': 'TP'})
-    fp_kw = _extract_keyword_counts(fp_texts).rename(columns={'count': 'FP'})
-
-    if tp_kw.empty and fp_kw.empty:
+    cv, matrices = _build_shared_vectorizer(groups)
+    if cv is None:
         return
 
-    df_kw = pd.merge(tp_kw, fp_kw, on='keyword', how='outer').fillna(0).infer_objects(copy=False)
-    df_kw[['TP', 'FP']] = df_kw[['TP', 'FP']].astype(int)
-    df_kw['total'] = df_kw['TP'] + df_kw['FP']
+    df_kw = pd.DataFrame({'keyword': cv.get_feature_names_out()})
+    for name, texts in groups.items():
+        rates = _counts_from_matrix(matrices[name], cv, len(texts), normalize=True)
+        df_kw[name] = df_kw['keyword'].map(rates.set_index('keyword')['count']).fillna(0) if not rates.empty else 0.0
+    df_kw['total'] = df_kw[list(groups.keys())].sum(axis=1)
 
-    # Hierarchie-Labels aus clustered_df anhängen
-    lookup = clustered_df[['keyword', 'level_1', 'level_2', 'level_3']].drop_duplicates('keyword')
-    df_kw = pd.merge(df_kw, lookup, on='keyword', how='inner')
-
+    # Hierarchie-Labels anhängen — level_2/level_1 kommen aus _build_lookup (immer aktuell)
+    df_kw = pd.merge(df_kw, _build_lookup(clustered_df), on='keyword', how='inner')
     if df_kw.empty:
         return
 
-    # --- Treemap: gesamte Hierarchie auf einen Blick ---
-    plot_treemap_keywords(df_kw, model_name, run_label, save_folder)
+    # --- Treemap: gesamte Hierarchie auf einen Blick (TP-Anteil als Farbe) ---
+    # plot_treemap_keywords(df_kw, model_name, run_label, save_folder)
 
-    # --- Diverging Bar Charts: TP vs. FP pro Ebene ---
-    plot_diverging_bars(df_kw, 'keyword',  model_name, run_label, save_folder, 'L4_Keywords',    top_n=20)
-    plot_diverging_bars(df_kw, 'level_3',  model_name, run_label, save_folder, 'L3_MARE',        top_n=20)
-    plot_diverging_bars(df_kw, 'level_2',  model_name, run_label, save_folder, 'L2_Regions',     top_n=10)
-    plot_diverging_bars(df_kw, 'level_1',  model_name, run_label, save_folder, 'L1_Modality',    top_n=5)
+    # --- Überblick L1/L2: Stacked % (TP/FP/FN) + Diverging (TP vs FP) ---
+    plot_grouped_rates(df_kw, 'level_1', model_name, run_label, save_folder, 'L1_Modality',  top_n=5)
+    plot_grouped_rates(df_kw, 'level_2', model_name, run_label, save_folder, 'L2_Regions',   top_n=10)
+    plot_diverging_bars(df_kw,   'level_2', model_name, run_label, save_folder, 'L2_Regions',   top_n=10)
+
+    # --- L3 und L4 je L2-Kategorie (Face / Body / Background / Audio) ---
+    for l2_name, df_l2 in df_kw.groupby('level_2'):
+        if df_l2.empty:
+            continue
+        safe_l2 = l2_name.replace('/', '_')
+        # Stacked % zeigt TP/FP/FN-Komposition je Subregion/Keyword
+        plot_grouped_rates(df_l2, 'level_3', model_name, run_label, save_folder,
+                              f'L3_Subregion_{safe_l2}', top_n=15)
+        plot_grouped_rates(df_l2, 'keyword',  model_name, run_label, save_folder,
+                              f'L4_Keywords_{safe_l2}',  top_n=20)
+        # Diverging zeigt TP vs. FP Stärke (ohne FN) für schnellen Vergleich
+        plot_diverging_bars(df_l2, 'level_3', model_name, run_label, save_folder,
+                            f'L3_Subregion_{safe_l2}', top_n=15)
+        plot_diverging_bars(df_l2, 'keyword',  model_name, run_label, save_folder,
+                            f'L4_Keywords_{safe_l2}',  top_n=20)
 
     
 
 
-# --- MODUL 3: HALLUZINATIONSMATRIX ---
-def plot_hallucination_matrix(aggregated_fp_dict, output_path, expected_models):
-    """Erstellt eine Heatmap der Fehlerbegründungen über alle Modelle hinweg."""
-    matrix_data = []
-    
-    for model_name, fp_texts in aggregated_fp_dict.items():
-        if not fp_texts: continue
-        
-        cv = CountVectorizer(ngram_range=(2, 3), stop_words=DOMAIN_STOPS, max_features=20)
-        try:
-            counts = cv.fit_transform(fp_texts)
-            words = cv.get_feature_names_out()
-            sums = counts.sum(axis=0).A1
-            
-            total_fps = len(fp_texts)
-            for word, count in zip(words, sums):
-                matrix_data.append({
-                    'Model': model_name,
-                    'Phrase': word,
-                    'Frequency (%)': round((count / total_fps) * 100, 1)
-                })
-        except ValueError:
+
+def plot_model_comparison_heatmap(model_texts, clustered_df, save_folder, metric='FP', level='level_2'):
+    """
+    Heatmap: Zeile = Region (L2 oder L3), Spalte = Modell.
+    Zellwert = normalisierte Erwähnungsrate für die gewählte Metrik (FP/TP/FN/TN).
+    Erlaubt direkten Vergleich: Welches Modell hat bei welcher Region die höchste FP-Rate?
+
+    model_texts: {model_name: {'TP': [...], 'FP': [...], 'FN': [...], 'TN': [...]}}
+    """
+    lookup = _build_lookup(clustered_df)
+    records = []
+
+    for model_name, texts in model_texts.items():
+        groups = {k: v for k, v in texts.items()}
+        cv, matrices = _build_shared_vectorizer(groups)
+        if cv is None:
             continue
 
-    if not matrix_data:
-        print("Keine Daten für Halluzinationsmatrix vorhanden.")
+        n = len(texts.get(metric, []))
+        if n == 0:
+            continue
+
+        df_counts = _counts_from_matrix(matrices.get(metric), cv, n, normalize=True)
+        if df_counts.empty:
+            continue
+
+        df_counts = pd.merge(df_counts, lookup, on='keyword', how='inner')
+        if df_counts.empty:
+            continue
+
+        for region, grp in df_counts.groupby(level):
+            records.append({
+                'Model':  get_plot_label(model_name),
+                'Region': region,
+                'Rate':   grp['count'].mean()  # Mittelwert: unabhängig von Keyword-Anzahl je Region
+            })
+
+    if not records:
+        print(f"Keine Daten für Modellvergleichs-Heatmap ({metric}).")
         return
 
-    df_matrix = pd.DataFrame(matrix_data)
-    top_overall = df_matrix.groupby('Phrase')['Frequency (%)'].sum().nlargest(20).index
-    
-    df_pivot = df_matrix[df_matrix['Phrase'].isin(top_overall)].pivot(
-        index='Phrase', columns='Model', values='Frequency (%)'
-    ).fillna(0.0)
+    df_heat = pd.DataFrame(records).pivot(index='Region', columns='Model', values='Rate').fillna(0)
 
-    # Alle Modelle in der X-Achse erzwingen
-    df_pivot = df_pivot.reindex(columns=expected_models).fillna(0.0)
+    # Sortierung: Regionen nach Gesamt-Rate absteigend
+    df_heat = df_heat.loc[df_heat.sum(axis=1).sort_values(ascending=False).index]
 
-    plt.figure(figsize=(14, 10))
-    sns.heatmap(df_pivot, annot=True, cmap="YlOrRd", fmt=".1f", cbar_kws={'label': 'Vorkommen in FPs (%)'})
-    plt.title("Halluzinations-Matrix: Warum irren sich die Modelle?", fontsize=14, fontweight='bold')
+    fig_h = max(5, len(df_heat) * 0.5 + 1)
+    fig_w = max(10, len(df_heat.columns) * 1.2 + 2)
+    plt.figure(figsize=(fig_w, fig_h))
+    sns.heatmap(
+        df_heat, annot=True, fmt='.3f', cmap='YlOrRd',
+        linewidths=0.4, cbar_kws={'label': f'{metric}-Rate (Nennungen pro Text)'}
+    )
+    plt.title(f'Modellvergleich: {metric}-Rate je {level} (aggregiert über alle Runs)', fontsize=12)
+    plt.xlabel('')
+    plt.ylabel('')
+    plt.xticks(rotation=30, ha='right', fontsize=9)
     plt.tight_layout()
-    plt.savefig(output_path, dpi=300)
+
+    fname = os.path.join(save_folder, f'model_comparison_heatmap_{metric}_{level}.png')
+    plt.savefig(fname, dpi=250)
     plt.close()
-    print(f"Halluzinationsmatrix gespeichert: {output_path}")
+    print(f" -> Modellvergleichs-Heatmap gespeichert: {fname}")
 
 
-# --- MANAGER: DIE HAUPTFUNKTION ---
-def run_justification_deep_analysis(df_master):
-    """Koordiniert die gesamte Analyse."""
-    
-    # 1. Coverage-Check: lohnt sich Unterteilung von Audio/Body/Background?
-    #analyze_region_coverage(df_master)
+def plot_chapter_overview_heatmap(model_texts, clustered_df, save_folder):
+    """
+    Übersichts-Heatmap für den Kapitelanfang:
+    3 Subplots nebeneinander — TP-Rate | FP-Rate | FN-Rate
+    Zeilen = Modelle (Display-Namen), Spalten = L2-Regionen
+    Farbe = normalisierte Erwähnungsrate (Nennungen pro Text)
 
-    # 2. Zentrales Inventar für das Mapping erstellen und clustern
+    Ermöglicht auf einen Blick: Wo erkennt jedes Modell korrekt (TP),
+    wo produziert es Fehlalarme (FP), wo übersieht es Deepfakes (FN)?
+    """
+    lookup = _build_lookup(clustered_df)
+
+    L2_ORDER = ['Face', 'Background', 'Body', 'Audio']
+    metrics   = ['TP', 'FP', 'FN']
+    titles    = ['TP-Rate\n(korrekte Deepfake-Erkennung)',
+                 'FP-Rate\n(Fehlalarme bei echten Videos)',
+                 'FN-Rate\n(übersehene Deepfakes)']
+    cmaps     = ['Greens', 'Reds', 'Oranges']
+
+    # --- Rates berechnen ---
+    # {metric: DataFrame mit index=Modell, columns=L2}
+    rate_tables = {m: {} for m in metrics}
+
+    for model_name, texts in model_texts.items():
+        groups = {k: v for k, v in texts.items()}
+        cv, matrices = _build_shared_vectorizer(groups)
+        if cv is None:
+            continue
+
+        display = get_plot_label(model_name)
+        for metric in metrics:
+            n = len(texts.get(metric, []))
+            if n == 0:
+                for l2 in L2_ORDER:
+                    rate_tables[metric].setdefault(l2, {})[display] = 0.0
+                continue
+
+            df_m = _counts_from_matrix(matrices.get(metric), cv, n, normalize=True)
+            if df_m.empty:
+                continue
+            df_m = pd.merge(df_m, lookup, on='keyword', how='inner')
+            if df_m.empty:
+                continue
+
+            for l2, grp in df_m.groupby('level_2'):
+                rate_tables[metric].setdefault(l2, {})[display] = grp['count'].mean()
+
+    # DataFrames bauen und auf L2_ORDER einschränken
+    dfs = {}
+    for metric in metrics:
+        df = pd.DataFrame(rate_tables[metric]).reindex(columns=L2_ORDER).fillna(0)
+        # Modellreihenfolge: nach Familien sortieren
+        family_order = []
+        for fam in sorted(set(BASE_MODEL_DISPLAY_NAMES.values())):
+            for var in ['', '+I', '+T', '+I+T']:
+                name = f'{fam}{var}'
+                if name in df.index:
+                    family_order.append(name)
+        remaining = [m for m in df.index if m not in family_order]
+        dfs[metric] = df.reindex(family_order + remaining)
+
+    # --- Plot ---
+    fig, axes = plt.subplots(1, 3, figsize=(16, max(4, len(dfs['TP']) * 0.55 + 2)),
+                             sharey=True)
+
+    for ax, metric, title, cmap in zip(axes, metrics, titles, cmaps):
+        df_plot = dfs[metric]
+        im = ax.imshow(df_plot.values, aspect='auto', cmap=cmap, vmin=0)
+
+        # Achsenbeschriftungen
+        ax.set_xticks(range(len(L2_ORDER)))
+        ax.set_xticklabels(L2_ORDER, fontsize=9, rotation=30, ha='right')
+        ax.set_yticks(range(len(df_plot)))
+        ax.set_yticklabels(df_plot.index, fontsize=8)
+        ax.set_title(title, fontsize=9, pad=8)
+
+        # Trennlinien zwischen Modellfamilien
+        prev_fam = None
+        for i, name in enumerate(df_plot.index):
+            fam = next((v for _, v in BASE_MODEL_DISPLAY_NAMES.items()
+                        if name.startswith(v)), None)
+            if fam and fam != prev_fam and i > 0:
+                ax.axhline(i - 0.5, color='white', linewidth=2)
+            prev_fam = fam
+
+        # Zellwerte eintragen
+        for r in range(df_plot.shape[0]):
+            for c in range(df_plot.shape[1]):
+                val = df_plot.values[r, c]
+                text_color = 'white' if val > df_plot.values.max() * 0.6 else 'black'
+                ax.text(c, r, f'{val:.2f}', ha='center', va='center',
+                        fontsize=7, color=text_color)
+
+        plt.colorbar(im, ax=ax, shrink=0.6,
+                     label='Ø Nennungen pro Text')
+
+    fig.suptitle('Modellvergleich: Keyword-Erwähnungsraten je L2-Region (aggregiert über alle Runs)',
+                 fontsize=11, fontweight='bold', y=1.01)
+    plt.tight_layout()
+
+    fname = os.path.join(save_folder, 'chapter_overview_heatmap_L2.png')
+    plt.savefig(fname, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f" -> Kapitel-Übersichts-Heatmap gespeichert: {fname}")
+
+
+# ---------------------------------------------------------------------------
+# MODULARE HILFSFUNKTIONEN — können einzeln aufgerufen werden
+# ---------------------------------------------------------------------------
+
+def _load_clustered_df(force_recluster=False):
+    """
+    Lädt clustered_df aus dem gecachten Excel, falls vorhanden.
+    Mit force_recluster=True wird immer neu geclustert (SBERT läuft neu).
+    Gibt None zurück wenn weder Cache noch Inventar vorhanden oder Cache veraltet ist.
+    """
+    cache_path = os.path.join(RESULTS_FOLDER, 'keyword_inventory_clustered.xlsx')
+    if not force_recluster and os.path.exists(cache_path):
+        df = pd.read_excel(cache_path)
+        valid_l3 = set(KEYWORD_HIERARCHY.keys())
+        cached_l3 = set(df['level_3'].dropna().unique())
+        invalid = cached_l3 - valid_l3
+        if invalid:
+            print(f" -> Cache veraltet (unbekannte level_3-Werte: {invalid}) — starte Re-Clustering ...")
+            return None
+        # Re-derive level_2/level_1 to ensure consistency with current KEYWORD_HIERARCHY
+        df['level_2'] = df['level_3'].map(lambda r: KEYWORD_HIERARCHY.get(r, ('Background', 'Frame'))[0])
+        df['level_1'] = df['level_3'].map(lambda r: KEYWORD_HIERARCHY.get(r, ('Background', 'Frame'))[1])
+        print(f" -> Lade gecachtes Keyword-Clustering: {cache_path}")
+        return df
+    print(" -> Kein Cache gefunden oder force_recluster=True — starte SBERT-Clustering ...")
+    return None
+
+
+def _extract_all_model_texts(df_master):
+    """Extrahiert TP/FP/FN/TN-Texte pro Modell aggregiert über alle Runs."""
+    all_model_texts = {}
+    for _, df_run in iterate_runs(df_master):
+        for model_name, model_df in df_run.groupby('base_model'):
+            t = _extract_texts(model_df)
+            if model_name not in all_model_texts:
+                all_model_texts[model_name] = {'TP': [], 'FP': [], 'FN': [], 'TN': []}
+            for k in ('TP', 'FP', 'FN', 'TN'):
+                all_model_texts[model_name][k].extend(t[k])
+    return all_model_texts
+
+
+def run_kw_clustering(df_master, force_recluster=False):
+    """
+    Schritt 1 (langsam): Inventar erstellen + SBERT-Clustering.
+    Ergebnis wird gecacht → danach nicht mehr nötig neu zu laufen.
+    Aufruf: run_kw_clustering(df_master, force_recluster=True)
+    """
+    clustered_df = _load_clustered_df(force_recluster)
+    if clustered_df is not None:
+        return clustered_df
     inventory_df = export_keyword_inventory(df_master)
-    clustered_df = cluster_keywords(inventory_df) if inventory_df is not None else None
+    if inventory_df is None:
+        return None
+    return cluster_keywords(inventory_df)
 
-    aggregated_fps = {}
 
-    # 3. Durch alle Runs und Modelle iterieren
+def run_kw_per_model_plots(df_master, clustered_df=None, force_recluster=False):
+    """
+    Schritt 2: Hierarchische Plots pro Run × Modell.
+    Lädt clustered_df aus Cache wenn nicht übergeben.
+    Aufruf: run_kw_per_model_plots(df_master)
+    """
+    if clustered_df is None:
+        clustered_df = _load_clustered_df(force_recluster)
+    if clustered_df is None:
+        print("Fehler: Kein clustered_df — zuerst run_kw_clustering() aufrufen.")
+        return
+
     for run_label, df_run in iterate_runs(df_master):
-
         run_folder = os.path.join(base_plot_folder, run_label, 'Keywords_Analysis')
         os.makedirs(run_folder, exist_ok=True)
-
         for model_name, model_df in df_run.groupby('base_model'):
-            tp_mask = (model_df['y_true'] == 1) & (model_df['y_pred'] == 1)
-            fp_mask = (model_df['y_true'] == 0) & (model_df['y_pred'] == 1)
+            t = _extract_texts(model_df)
+            print(f"  [{run_label}] {model_name}: TP={len(t['TP'])}, FP={len(t['FP'])}, FN={len(t['FN'])}, TN={len(t['TN'])}")
+            plot_keywords_hierarchical(t, model_name, run_label, run_folder, clustered_df)
 
-            tp_list = model_df[tp_mask]['justification'].dropna().tolist()
-            fp_list = model_df[fp_mask]['justification'].dropna().tolist()
 
-            # Hierarchische Plots (L1 / L2 / L3) mit TP (grün) und FP (rot)
-            if clustered_df is not None:
-                plot_keywords_hierarchical(tp_list, fp_list, model_name, run_label, run_folder, clustered_df)
 
-            # Für die globale Matrix sammeln
-            if model_name not in aggregated_fps:
-                aggregated_fps[model_name] = []
-            aggregated_fps[model_name].extend(fp_list)
+def run_kw_comparison_heatmaps(df_master, clustered_df=None, force_recluster=False):
+    """
+    Schritt 4: Modellvergleichs-Heatmaps + Kapitel-Übersichts-Heatmap.
+    Schnell hinzufügbar ohne die anderen Schritte neu laufen zu lassen.
+    Aufruf: run_kw_comparison_heatmaps(df_master)
+    """
+    if clustered_df is None:
+        clustered_df = _load_clustered_df(force_recluster)
+    if clustered_df is None:
+        print("Fehler: Kein clustered_df — zuerst run_kw_clustering() aufrufen.")
+        return
 
-    # 3. Finale Matrix über alle Runs hinweg
-    matrix_path = os.path.join(base_plot_folder, 'global_hallucination_matrix.png')
-    expected_models = sorted(aggregated_fps.keys())
-    plot_hallucination_matrix(aggregated_fps, matrix_path, expected_models)
+    all_model_texts = _extract_all_model_texts(df_master)
+    cmp_folder = os.path.join(base_plot_folder, 'Aggregated', 'Model_Comparison')
+    os.makedirs(cmp_folder, exist_ok=True)
+
+    print(" -> Erstelle Modellvergleichs-Heatmaps ...")
+    for metric in ['FP', 'FN']:
+        plot_model_comparison_heatmap(all_model_texts, clustered_df, cmp_folder,
+                                      metric=metric, level='level_2')
+        plot_model_comparison_heatmap(all_model_texts, clustered_df, cmp_folder,
+                                      metric=metric, level='level_3')
+
+    print(" -> Erstelle Kapitel-Übersichts-Heatmap ...")
+    plot_chapter_overview_heatmap(all_model_texts, clustered_df, cmp_folder)
+
+
+# --- MANAGER: Alles auf einmal ---
+def run_justification_deep_analysis(df_master, force_recluster=False):
+    """
+    Führt alle Keyword-Analyse-Schritte aus.
+    Mit force_recluster=False wird SBERT-Clustering aus dem Cache geladen
+    wenn keyword_inventory_clustered.xlsx bereits existiert.
+
+    Einzelne Schritte können auch direkt aufgerufen werden:
+      run_kw_clustering(df_master)           # nur SBERT (langsam, einmalig)
+      run_kw_per_model_plots(df_master)      # Plots pro Run × Modell
+      run_kw_comparison_heatmaps(df_master)  # Vergleichs-Heatmaps (schnell)
+    """
+    analyze_region_coverage(df_master)
+
+    clustered_df = run_kw_clustering(df_master, force_recluster=force_recluster)
+    if clustered_df is None:
+        return
+
+    run_kw_per_model_plots(df_master, clustered_df)
+    run_kw_comparison_heatmaps(df_master, clustered_df)
 
 
 
@@ -1527,15 +1952,14 @@ def run_best_per_family_ensemble(df_master):
     families = sorted(list(set(BASE_MODEL_DISPLAY_NAMES.values())))
     ensemble_results = []
 
+    all_runs = {r: d for r, d in iterate_runs(df_master)}
+
     for run_label in RUN_SUFFIXES:
         run_name = f"Run{run_label}"
-        # Nutze iterate_runs Logik indirekt oder direkt filtern
-        df_run_master = list(iterate_runs(df_master))
-        # Suche den passenden Run in der Liste
-        df_run = next((d for r, d in df_run_master if r == run_name), None)
-        
+        df_run = all_runs.get(run_name)
+
         if df_run is None: continue
-        
+
         print(f" -> Berechne Ensemble für {run_name}...")
         best_models_tech = []
         best_models_display = []
@@ -1574,42 +1998,101 @@ def run_best_per_family_ensemble(df_master):
         })
         ensemble_results.append(metrics)
 
-    if ensemble_results:
-        df_ens = pd.DataFrame(ensemble_results)
-        
-        # 1. EXCEL SPEICHERN
-        df_ens.to_excel('results_ensemble_best_per_family.xlsx', index=False)
-        
-        # 2. LATEX TABELLE ERSTELLEN
-        # Spalten selektieren wie gewünscht
-        cols_latex = ['Run', 'F1-Score (%)', 'Accuracy (%)', 'Precision (%)', 'Recall (%)', 'Models_Used_Display']
-        df_latex = df_ens[cols_latex].copy()
-        
-        # Formatierung: Punkt zu Komma (German Style) und Rundung
-        for col in ['F1-Score (%)', 'Accuracy (%)', 'Precision (%)', 'Recall (%)']:
-            df_latex[col] = df_latex[col].map(lambda x: f"{x:.1f}".replace('.', ','))
-        
-        # Spaltennamen für LaTeX säubern (Prozentzeichen escapen)
-        df_latex.columns = [c.replace('%', r'\%').replace('_', r'\_') for c in df_latex.columns]
-        
-        # Models_Used_Display: Kommas in der Liste schöner umbrechen für LaTeX
-        df_latex[df_latex.columns[-1]] = df_latex[df_latex.columns[-1]].str.replace(', ', ', ')
+    # ── TOP-3 BEST-PER-FAMILY ENSEMBLE ───────────────────────────────────────
+    # Wie Best-per-Family, aber nur die 3 Familien mit dem höchsten F1-Score
+    top3_results = []
 
-        # Speichern als .tex Datei
-        latex_file = 'table_ensemble_results.tex'
-        # Spaltendefinition: l für Run, c für die 4 Metriken, p{6cm} für die langen Modellnamen
-        col_format = 'lcccc p{6cm}' 
+    for run_label in RUN_SUFFIXES:
+        run_name = f"Run{run_label}"
+        df_run = all_runs.get(run_name)
+        if df_run is None:
+            continue
+
+        print(f" -> Berechne Top-3 Best-per-Family Ensemble für {run_name}...")
+
+        # Bestes Modell je Familie + zugehöriger F1-Score ermitteln
+        family_champions = []
+        for fam_name in families:
+            fam_df = df_run[df_run['base_model'].apply(
+                lambda x: get_plot_label(x).startswith(fam_name))]
+            if fam_df.empty:
+                continue
+            best_f1, champion_tech = -1, None
+            for model_tech_name, model_data in fam_df.groupby('base_model'):
+                f1 = f1_score(model_data['y_true'], model_data['y_pred'],
+                              pos_label=1, zero_division=0)
+                if f1 > best_f1:
+                    best_f1, champion_tech = f1, model_tech_name
+            if champion_tech:
+                family_champions.append((champion_tech, best_f1))
+
+        # Nur die 3 besten Familien verwenden
+        family_champions.sort(key=lambda x: x[1], reverse=True)
+        top3_tech    = [m for m, _ in family_champions[:3]]
+        top3_display = [get_plot_label(m) for m in top3_tech]
+
+        df_top3 = df_run[df_run['base_model'].isin(top3_tech)].copy()
+        ensemble_preds = df_top3.groupby('video_id')['y_pred'].mean()
+        ensemble_binary = (ensemble_preds > 0.5).astype(int)
+
+        y_true_map = df_run.drop_duplicates('video_id').set_index('video_id')['y_true']
+        common_idx = ensemble_binary.index.intersection(y_true_map.index)
+
+        metrics = calculate_metrics(y_true_map.loc[common_idx],
+                                    ensemble_binary.loc[common_idx])
+        metrics.update({
+            'Run': run_name.replace('_', ' '),
+            'Models_Used_Display': ", ".join(top3_display)
+        })
+        top3_results.append(metrics)
+
+    if ensemble_results:
+        df_ens  = pd.DataFrame(ensemble_results)
+        df_top3 = pd.DataFrame(top3_results) if top3_results else pd.DataFrame()
+
+        # 1. EXCEL SPEICHERN (zwei Reiter)
+        with pd.ExcelWriter(os.path.join(RESULTS_FOLDER, 'results_ensemble_best_per_family.xlsx'), engine='openpyxl') as writer:
+            df_ens.to_excel(writer, sheet_name='Best_per_Family', index=False)
+            if not df_top3.empty:
+                df_top3.to_excel(writer, sheet_name='Top3_Global', index=False)
         
-        df_latex.to_latex(
-            latex_file, 
-            index=False, 
-            escape=False, 
-            column_format=col_format,
-            caption="Ergebnisse des Best-per-Family Ensembles über alle Inferenzdurchläufe",
-            label="tab:ensemble_results"
+        # 2. LATEX TABELLEN ERSTELLEN
+        # ── Hilfsfunktion: DataFrame → .tex ──────────────────────────────────
+        def _to_latex_file(df_in, filename, caption, label):
+            df_l = df_in[cols_latex].copy()
+            for col in ['F1-Score (%)', 'Accuracy (%)', 'Precision (%)', 'Recall (%)']:
+                df_l[col] = df_l[col].map(lambda x: f"{x:.1f}".replace('.', ','))
+            df_l.columns = [c.replace('%', r'\%').replace('_', r'\_')
+                            for c in df_l.columns]
+            df_l.to_latex(
+                filename,
+                index=False,
+                escape=False,
+                column_format='lcccc p{6cm}',
+                caption=caption,
+                label=label
+            )
+            print(f" -> LaTeX-Tabelle gespeichert: {filename}")
+
+        cols_latex = ['Run', 'F1-Score (%)', 'Accuracy (%)',
+                      'Precision (%)', 'Recall (%)', 'Models_Used_Display']
+
+        # Best-per-Family
+        _to_latex_file(
+            df_ens,
+            os.path.join(RESULTS_FOLDER, 'table_ensemble_best_per_family.tex'),
+            caption="Ergebnisse des Best-per-Family Ensembles über alle Runs",
+            label="tab:ensemble_best_per_family"
         )
-        
-        print(f" -> LaTeX-Tabelle gespeichert: {latex_file}")
+
+        # Top-3 Global
+        if not df_top3.empty:
+            _to_latex_file(
+                df_top3,
+                os.path.join(RESULTS_FOLDER, 'table_ensemble_top3.tex'),
+                caption="Ergebnisse des Top-3 Best-per-Family Ensembles über alle Runs",
+                label="tab:ensemble_top3"
+            )
 
 
 def run_worst_case_extraction(df_master):
@@ -1621,67 +2104,336 @@ def run_worst_case_extraction(df_master):
     print("\n=== Worst Case / Hardest Samples Analysis (Top 10) ===")
     
     for run_label, df_run in iterate_runs(df_master):
-        # 1. Pivot Tabelle: Zeilen=Videos, Spalten=Modelle, Werte=0/1
+        # 1. Metadaten (y_true) pro Video holen
+        meta_cols_needed = ['y_true'] + [c for c in META_COLS if c in df_run.columns]
+        meta_info = (df_run[['video_id'] + meta_cols_needed]
+                     .drop_duplicates('video_id')
+                     .set_index('video_id'))
+
+        # 2. Pivot: Zeilen=Videos, Spalten=Modelle, Werte=is_correct
         df_run['is_correct'] = (df_run['y_pred'] == df_run['y_true']).astype(int)
-        
-        # Pivot erstellen
         pivot = df_run.pivot(index='video_id', columns='base_model', values='is_correct')
-        
-        # 2. Metriken pro Video berechnen
-        # Summe der korrekten Vorhersagen (Zeilensumme)
-        pivot['correct_count'] = pivot.sum(axis=1)
-        pivot['total_models'] = pivot.shape[1] - 1 # Anzahl Modelle (minus die Spalte correct_count selbst)
-        
-        # Fehlerquote berechnen (1.0 = Alle falsch, 0.0 = Alle richtig)
-        pivot['failure_rate'] = 1.0 - (pivot['correct_count'] / pivot['total_models'])
-        
-        # 3. Filtern & Sortieren
-        # Wir nehmen Videos, bei denen mindestens 50% der Modelle falsch lagen (Majority Fail)
-        # ODER einfach die Top 10 schlechtesten, egal wie gut sie sind.
-        
-        # Sortieren: Höchste Failure Rate zuerst, bei Gleichstand wenigste Correct Counts
-        hardest_samples = pivot.sort_values(by=['failure_rate', 'correct_count'], ascending=[False, True]).head(10)
-        
-        # Nur Videos nehmen, die überhaupt Fehler hatten (Failure Rate > 0)
-        hardest_samples = hardest_samples[hardest_samples['failure_rate'] > 0]
-        
-        if not hardest_samples.empty:
-            # 4. Metadaten wieder anhängen
-            # Wir holen uns Dataset, Type etc. aus dem Original-DF (die erste Zeile pro Video reicht)
-            meta_cols_needed = ['y_true'] + [c for c in META_COLS if c in df_run.columns]
-            meta_info = df_run[['video_id'] + meta_cols_needed].drop_duplicates('video_id').set_index('video_id')
-            
-            # Join: Hardest Samples + Metadaten
-            result = hardest_samples[['correct_count', 'total_models', 'failure_rate']].join(meta_info, how='inner')
-            
-            # Runden für schöne Excel
-            result['failure_rate'] = result['failure_rate'].round(1)
-            
-            # Speichern
-            filename = f'{run_label}_Hardest_Samples.xlsx'
-            result.to_excel(filename)
-            print(f" -> {run_label}: Top {len(result)} schwierigste Videos gespeichert in '{filename}'.")
-            
-            # Kurzer Print zur Info
-            top_video = result.index[0]
-            top_fail = result.iloc[0]['failure_rate'] * 100
-            print(f"    (Härtestes Video: {top_video} mit {top_fail:.0f}% Fehlerquote)")
-            
+
+        model_cols = [c for c in pivot.columns]
+        pivot['correct_count'] = pivot[model_cols].sum(axis=1)
+        pivot['total_models']  = len(model_cols)
+        pivot['failure_rate']  = 1.0 - (pivot['correct_count'] / pivot['total_models'])
+
+        # y_true je Video anhängen für FN/FP-Trennung
+        pivot = pivot.join(meta_info[['y_true']], how='left')
+
+        def _top10(mask, label):
+            sub = pivot[mask & (pivot['failure_rate'] > 0)]
+            sub = sub.sort_values(
+                by=['failure_rate', 'correct_count'], ascending=[False, True]
+            ).head(10)
+            if sub.empty:
+                print(f"    {label}: keine Fehler.")
+                return pd.DataFrame()
+            result = sub[['correct_count', 'total_models', 'failure_rate']].join(
+                meta_info, how='inner'
+            )
+            result['failure_rate'] = result['failure_rate'].round(2)
+            print(f"    {label}: {len(result)} Videos "
+                  f"(härtestes: {result.index[0]}, "
+                  f"{result.iloc[0]['failure_rate']*100:.0f}% Fehlerquote)")
+            return result
+
+        # 3. FN = echte Deepfakes, die als Real klassifiziert wurden
+        fn_result = _top10(pivot['y_true'] == 1, 'FN (Deepfake als Real)')
+        # 4. FP = echte Real-Videos, die als Fake klassifiziert wurden
+        fp_result = _top10(pivot['y_true'] == 0, 'FP (Real als Deepfake)')
+
+        if not fn_result.empty or not fp_result.empty:
+            filename = os.path.join(RESULTS_FOLDER, f'{run_label}_Hardest_Samples.xlsx')
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                if not fn_result.empty:
+                    fn_result.to_excel(writer, sheet_name='FN_Deepfake_als_Real')
+                if not fp_result.empty:
+                    fp_result.to_excel(writer, sheet_name='FP_Real_als_Deepfake')
+            print(f" -> {run_label}: Hardest Samples gespeichert in '{filename}'.")
+
+            # ── FRAME-EXTRAKTION ─────────────────────────────────────────────
+            for error_type, result_df in [('FN', fn_result), ('FP', fp_result)]:
+                if result_df.empty:
+                    continue
+                frame_dir = os.path.join('frames', run_label, error_type)
+                os.makedirs(frame_dir, exist_ok=True)
+
+                for video_id in result_df.index:
+                    # Videodatei suchen: data/processed/{run_nr}/{video_id}.mp4
+                    pattern = os.path.join(VIDEO_SOURCE_PATH, '**',
+                                           f'{video_id}.mp4')
+                    matches = glob.glob(pattern, recursive=True)
+                    if not matches:
+                        print(f"    [WARN] Video nicht gefunden: {video_id}")
+                        continue
+
+                    cap = cv2.VideoCapture(matches[0])
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    # Mittleren Frame extrahieren
+                    mid = max(0, total_frames // 2)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, mid)
+                    ret, frame = cap.read()
+                    cap.release()
+
+                    if ret:
+                        out_path = os.path.join(frame_dir, f'{video_id}.jpg')
+                        cv2.imwrite(out_path, frame)
+                    else:
+                        print(f"    [WARN] Frame konnte nicht gelesen werden: {video_id}")
+
+                print(f"    Frames gespeichert: frames/{run_label}/{error_type}/")
         else:
-            print(f" -> {run_label}: Perfekter Run? Keine Fehler gefunden.")
+            print(f" -> {run_label}: Keine Fehler gefunden.")
 
     print(" Hardest Samples Analyse fertig.")
+
+def run_audio_analysis(df_master):
+    """
+    Separate Analyse: Klassifikationsleistung nach Audio-Präsenz.
+    Nur Baseline-Modelle, normalisierter Stacked Bar + Metriktabelle pro Run.
+    Setzt voraus, dass 'audio' in dataset_info.xlsx vorhanden ist.
+    """
+    print("\n=== Audio Analysis ===")
+
+    AUDIO_COL = 'audio'
+    baseline_keys = [k for k in BASE_MODEL_DISPLAY_NAMES
+                     if '_indicators' not in k and '_thinking' not in k]
+
+    save_dir = os.path.join(base_plot_folder, 'Audio_Analysis')
+    os.makedirs(save_dir, exist_ok=True)
+
+    all_metrics = []
+
+    for run_label, df_run in iterate_runs(df_master):
+        if AUDIO_COL not in df_run.columns:
+            print(f" -> '{AUDIO_COL}'-Spalte nicht in df_master gefunden. "
+                  f"Prüfe ob dataset_info.xlsx die Spalte enthält.")
+            return
+
+        df_run = df_run[df_run['base_model'].isin(baseline_keys)].copy()
+        df_run['Outcome'] = (df_run['y_pred'] == df_run['y_true']).map(
+            {True: 'Korrekt', False: 'Fehler'}
+        )
+        df_run['Model'] = df_run['base_model'].apply(get_plot_label)
+        df_run[AUDIO_COL] = df_run[AUDIO_COL].astype(str).str.strip()
+
+        audio_groups = sorted(df_run[AUDIO_COL].dropna().unique())
+        models_ordered = sorted(df_run['Model'].unique())
+        n_models = len(models_ordered)
+
+        # ── STACKED BAR CHART ────────────────────────────────────────────────
+        fig, axes = plt.subplots(1, n_models, figsize=(3.5 * n_models, 5), sharey=True)
+        if n_models == 1:
+            axes = [axes]
+
+        for ax, model in zip(axes, models_ordered):
+            sub = df_run[df_run['Model'] == model].dropna(subset=[AUDIO_COL])
+
+            counts = (sub.groupby([AUDIO_COL, 'Outcome'], observed=False)
+                        .size()
+                        .unstack(fill_value=0))
+            for col in ['Korrekt', 'Fehler']:
+                if col not in counts.columns:
+                    counts[col] = 0
+
+            counts_pct = counts.div(counts.sum(axis=1), axis=0) * 100
+            counts_pct = counts_pct[['Korrekt', 'Fehler']]
+
+            counts_pct.plot(
+                kind='bar', stacked=True, ax=ax,
+                color=['#2ca02c', '#d62728'],
+                edgecolor='white', linewidth=0.5,
+                legend=(ax == axes[-1])
+            )
+
+            for i, (grp, row) in enumerate(counts.iterrows()):
+                ax.text(i, 101, f'n={int(row.sum())}', ha='center', va='bottom',
+                        fontsize=7, color='gray')
+
+            ax.set_title(model, fontsize=10, fontweight='bold')
+            ax.set_xlabel('')
+            ax.set_xticklabels(ax.get_xticklabels(), rotation=0, fontsize=9)
+            ax.set_ylim(0, 115)
+            ax.axhline(50, color='gray', linewidth=0.8, linestyle='--', alpha=0.6)
+            if ax == axes[0]:
+                ax.set_ylabel('Anteil (%)', fontsize=10)
+            else:
+                ax.set_ylabel('')
+            if ax == axes[-1]:
+                ax.legend(loc='upper right', fontsize=8, title='Ergebnis')
+
+        fig.suptitle(f'{run_label} – Klassifikationsergebnis nach Audio-Präsenz',
+                     fontsize=12, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f'Audio_StackedBar_{run_label}.png'),
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+
+        # ── METRIKTABELLE PRO AUDIO-GRUPPE ───────────────────────────────────
+        for model_name, model_df in df_run.groupby('base_model'):
+            for grp in audio_groups:
+                sub = model_df[model_df[AUDIO_COL] == grp]
+                if len(sub) < 3:
+                    continue
+                m = calculate_metrics(sub['y_true'], sub['y_pred'])
+                m.update({
+                    'Run': run_label,
+                    'Model': get_plot_label(model_name),
+                    'Audio': grp,
+                    'N': len(sub)
+                })
+                all_metrics.append(m)
+
+    if all_metrics:
+        df_out = pd.DataFrame(all_metrics)
+        cols_front = ['Run', 'Model', 'Audio', 'N',
+                      'Accuracy (%)', 'Precision (%)', 'Recall (%)', 'F1-Score (%)']
+        cols_front = [c for c in cols_front if c in df_out.columns]
+        df_out[cols_front].to_excel(
+            os.path.join(RESULTS_FOLDER, 'Audio_Metrics.xlsx'), index=False
+        )
+        print(f" -> Audio_Metrics.xlsx und Plots gespeichert in '{save_dir}'.")
+
+
+def run_inter_model_similarity(df_master):
+    """
+    Cross-Model Semantic Similarity via SBERT.
+    Ausgabe pro Run:
+      1. PCA-Scatter-Plot (alle 20 Varianten, Farbe=Familie, Form=Prompt-Variante)
+      2. 5×5 Familien-Heatmap (nur Baselines, mittlere Ähnlichkeit je Familie)
+    """
+    from sklearn.decomposition import PCA
+
+    print("\n=== Inter-Model Semantic Similarity (SBERT) ===")
+
+    # Marker-Formen je Prompt-Variante
+    VARIANT_MARKERS = {'': 'o', '+I': 's', '+T': '^', '+I+T': 'D'}
+
+    for run_label, df_run in iterate_runs(df_master):
+        save_dir = os.path.join(base_plot_folder, run_label)
+        os.makedirs(save_dir, exist_ok=True)
+
+        if 'justification' not in df_run.columns:
+            print(f" -> {run_label}: Keine Justification-Spalte.")
+            continue
+
+        models = sorted(df_run['base_model'].dropna().unique())
+        print(f" -> {run_label}: Encodiere {len(models)} Modelle...")
+
+        # ── Mittlere Embeddings berechnen (1 Vektor pro Modell) ──────────────
+        mean_embeddings = {}
+        for m in models:
+            texts = (df_run[df_run['base_model'] == m]['justification']
+                     .dropna().astype(str).tolist())
+            if len(texts) < 3:
+                continue
+            emb = get_sbert().encode(texts, convert_to_tensor=False,
+                                     show_progress_bar=False)
+            mean_embeddings[m] = emb.mean(axis=0)
+
+        valid_models = list(mean_embeddings.keys())
+        if len(valid_models) < 2:
+            print(f" -> {run_label}: Zu wenige Modelle.")
+            continue
+
+        emb_matrix = np.stack([mean_embeddings[m] for m in valid_models])
+        labels     = [get_plot_label(m) for m in valid_models]
+        colors     = [get_model_color(m) for m in valid_models]
+
+        variants = [next((v for v in ['+I+T', '+T', '+I', ''] if l.endswith(v)), '') for l in labels]
+
+        # ── PLOT 1: PCA-Scatter ───────────────────────────────────────────────
+        pca = PCA(n_components=2, random_state=42)
+        coords = pca.fit_transform(emb_matrix)
+        var_explained = pca.explained_variance_ratio_ * 100
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        for i, (label, color, variant) in enumerate(zip(labels, colors, variants)):
+            marker = VARIANT_MARKERS.get(variant, 'o')
+            ax.scatter(coords[i, 0], coords[i, 1],
+                       color=color, marker=marker,
+                       s=120, edgecolors='white', linewidths=0.8, zorder=3)
+            ax.annotate(label, (coords[i, 0], coords[i, 1]),
+                        textcoords='offset points', xytext=(6, 4),
+                        fontsize=7.5, color=color)
+
+        # Legende: Prompt-Varianten
+        from matplotlib.lines import Line2D
+        legend_variants = [
+            Line2D([0], [0], marker=m, color='gray', linestyle='None',
+                   markersize=8, label=f'Baseline{v}' if v == '' else v)
+            for v, m in VARIANT_MARKERS.items()
+        ]
+        ax.legend(handles=legend_variants, title='Prompt-Variante',
+                  loc='lower right', fontsize=8)
+
+        ax.set_xlabel(f'PC1 ({var_explained[0]:.1f}% Varianz)', fontsize=10)
+        ax.set_ylabel(f'PC2 ({var_explained[1]:.1f}% Varianz)', fontsize=10)
+        ax.set_title(f'{run_label}: Semantische Ähnlichkeit der Justifications (PCA)',
+                     fontsize=12, fontweight='bold')
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'Similarity_PCA_Scatter.png'),
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f" -> {run_label}: PCA-Scatter gespeichert.")
+
+        # ── PLOT 2: 5×5 Familien-Heatmap (nur Baselines) ─────────────────────
+        families = sorted(set(BASE_MODEL_DISPLAY_NAMES.values()))
+        baseline_keys = {v: k for k, v in BASE_MODEL_DISPLAY_NAMES.items()
+                         if '_indicators' not in k and '_thinking' not in k}
+
+        fam_embs = {}
+        for fam, tech_key in baseline_keys.items():
+            if tech_key in mean_embeddings:
+                fam_embs[fam] = mean_embeddings[tech_key]
+
+        fam_names = sorted(fam_embs.keys())
+        if len(fam_names) < 2:
+            continue
+
+        n_fam = len(fam_names)
+        sim_fam = np.zeros((n_fam, n_fam))
+        for i, f1 in enumerate(fam_names):
+            for j, f2 in enumerate(fam_names):
+                e1 = fam_embs[f1] / np.linalg.norm(fam_embs[f1])
+                e2 = fam_embs[f2] / np.linalg.norm(fam_embs[f2])
+                sim_fam[i, j] = float(np.dot(e1, e2))
+
+        df_fam = pd.DataFrame(sim_fam, index=fam_names, columns=fam_names)
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        sns.heatmap(df_fam, annot=True, fmt='.2f', cmap='YlOrRd',
+                    vmin=0.5, vmax=1.0, linewidths=0.5,
+                    cbar_kws={'label': 'Kosinus-Ähnlichkeit'}, ax=ax)
+        ax.set_title(f'{run_label}: Semantische Ähnlichkeit zwischen Modellfamilien\n'
+                     f'(Baseline-Modelle)',
+                     fontsize=11, fontweight='bold')
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right')
+        ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'Similarity_Family_Heatmap.png'),
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f" -> {run_label}: Familien-Heatmap gespeichert.")
+
 
 # ---------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------
 if __name__ == "__main__":
     
-    # 1. Raw Data Extraction & Aggregation 
+    # Raw Data Extraction & Aggregation 
     for s in RUN_SUFFIXES: run_analysis(s)
     run_aggregation_and_benchmark()
     
-    # 2. Master Data einmal laden
+    df_ground_truth = pd.read_excel(INFO_DATEI)
+    run_baseline_distribution_analysis(df_ground_truth)
+
+    # Master Data einmal laden
     df_master = load_master_data()
     
     if df_master is not None:
@@ -1693,12 +2445,13 @@ if __name__ == "__main__":
         # --- PER-RUN ANALYSEN ---
         #generate_plots(df_master) 
         #run_feature_importance_analysis(df_master)
-        #run_standard_correlation_analysis(df_master)
         #run_feature_analysis(df_master)
         #run_fairness_analysis(df_master)
         #run_intra_model_consistency_check(df_master)
-        run_justification_deep_analysis(df_master)
+        #run_inter_model_similarity(df_master)
+        #run_audio_analysis(df_master)
+        #run_justification_deep_analysis(df_master)
         #run_best_per_family_ensemble(df_master)
-        #run_worst_case_extraction(df_master)
+        run_worst_case_extraction(df_master)
         
     print("\n=== Fertig ===")

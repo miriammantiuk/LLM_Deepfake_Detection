@@ -3,6 +3,7 @@
 *.json
 *.png
 *.tex
+§.jpg
 data/
 plots/
 
