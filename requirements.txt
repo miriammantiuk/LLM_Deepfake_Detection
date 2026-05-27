@@ -1,0 +1,36 @@
+# ============================================================
+# Deepfake Detection — LLM Zero-Shot Evaluation
+# Requirements
+# Tested on Python 3.11
+# ============================================================
+
+# ----- Inference: Gemini -----
+google-generativeai>=1.0.0
+
+# ----- Inference: Qwen -----
+dashscope>=1.20.0
+
+# ----- Inference: Kimi & Seed (OpenAI-compatible) -----
+openai>=1.50.0
+
+# ----- Video validation (all inference scripts) -----
+opencv-python>=4.9.0
+
+# ----- Evaluation pipeline: data handling -----
+pandas>=2.2.0
+numpy>=1.26.0
+openpyxl>=3.1.2
+
+# ----- Evaluation pipeline: statistics & ML -----
+scipy>=1.13.0
+scikit-learn>=1.4.0
+
+# ----- Evaluation pipeline: visualisation -----
+matplotlib>=3.8.0
+seaborn>=0.13.0
+plotly>=5.20.0
+
+# ----- Evaluation pipeline: semantic analysis (SBERT) -----
+# sentence-transformers pulls in torch and transformers automatically
+sentence-transformers>=2.7.0
+torch>=2.2.0
