@@ -1416,52 +1416,6 @@ def _extract_texts(model_df):
     return {k: model_df[m]['justification'].dropna().tolist() for k, m in masks.items()}
 
 
-def plot_treemap_keywords(df_kw, model_name, run_label, save_folder):
-    """Interactive treemap (HTML) and static PNG of the keyword hierarchy.
-
-    Area = total mention frequency; colour = TP ratio
-    (green = TP-dominated, red = FP-dominated).
-    """
-    df = df_kw[df_kw['keyword'].str.split().str.len() >= 2].copy()
-    count_cols = [c for c in ['TP', 'FP', 'FN', 'TN'] if c in df.columns]
-    df['total'] = df[count_cols].sum(axis=1)
-    df = df[df['total'] > 0]
-    if df.empty:
-        return
-
-    # tp_ratio: TP share of TP+FP — a precision proxy; TN/FN intentionally excluded
-    tp_fp = df.get('TP', 0) + df.get('FP', 0)
-    df['tp_ratio'] = df['TP'] / tp_fp.replace(0, float('nan'))
-    plot_label = get_plot_label(model_name)
-    safe_name  = re.sub(r'[^\w\-_]', '_', model_name)
-
-    fig = px.treemap(
-        df,
-        path=[px.Constant('All'), 'level_1', 'level_2', 'level_3', 'keyword'],
-        values='total',
-        color='tp_ratio',
-        color_continuous_scale=['#de2d26', '#f7f7f7', '#2ca25f'],
-        color_continuous_midpoint=0.5,
-        range_color=[0, 1],
-        title=f"{plot_label} | {run_label}",
-        hover_data={'TP': True, 'FP': True, 'tp_ratio': ':.2f'},
-    )
-    fig.update_traces(textinfo='label+value')
-    fig.update_layout(
-        margin=dict(t=50, l=10, r=10, b=10),
-        coloraxis_colorbar=dict(title='TP-Anteil', tickvals=[0, 0.5, 1], ticktext=['FP', '50/50', 'TP'])
-    )
-
-    html_path = os.path.join(save_folder, f"{safe_name}_treemap_{run_label}.html")
-    fig.write_html(html_path)
-
-    try:
-        png_path = os.path.join(save_folder, f"{safe_name}_treemap_{run_label}.png")
-        fig.write_image(png_path, width=1400, height=900)
-    except Exception:
-        pass  # kaleido not installed
-
-
 def plot_grouped_rates(df_kw, group_col, model_name, run_label, save_folder, level_name, top_n=20):
     """Grouped bar chart of normalised mention rates per outcome group.
 
@@ -1576,9 +1530,6 @@ def plot_keywords_hierarchical(groups, model_name, run_label, save_folder, clust
     df_kw = pd.merge(df_kw, _build_lookup(clustered_df), on='keyword', how='inner')
     if df_kw.empty:
         return
-
-    # Treemap: full hierarchy overview
-    # plot_treemap_keywords(df_kw, model_name, run_label, save_folder)
 
     # L1/L2 overview: grouped rates and TP vs FP diverging chart
     plot_grouped_rates(df_kw, 'level_1', model_name, run_label, save_folder, 'L1_Modality',  top_n=5)
@@ -2145,113 +2096,6 @@ def run_worst_case_extraction(df_master):
 
     print(" Hardest samples analysis complete.")
 
-def run_audio_analysis(df_master):
-    """Analyse classification performance by audio presence.
-
-    Baseline models only. Outputs a normalised stacked bar chart and a
-    metrics table per run. Requires an 'audio' column in dataset_info.xlsx.
-    """
-    print("\n=== Audio Analysis ===")
-
-    AUDIO_COL = 'audio'
-    baseline_keys = [k for k in BASE_MODEL_DISPLAY_NAMES
-                     if '_indicators' not in k and '_thinking' not in k]
-
-    save_dir = os.path.join(base_plot_folder, 'Audio_Analysis')
-    os.makedirs(save_dir, exist_ok=True)
-
-    all_metrics = []
-
-    for run_label, df_run in iterate_runs(df_master):
-        if AUDIO_COL not in df_run.columns:
-            print(f" -> '{AUDIO_COL}' column not found in df_master. "
-                  f"Check whether dataset_info.xlsx contains the column.")
-            return
-
-        df_run = df_run[df_run['base_model'].isin(baseline_keys)].copy()
-        df_run['Outcome'] = (df_run['y_pred'] == df_run['y_true']).map(
-            {True: 'Korrekt', False: 'Fehler'}
-        )
-        df_run['Model'] = df_run['base_model'].apply(get_plot_label)
-        df_run[AUDIO_COL] = df_run[AUDIO_COL].astype(str).str.strip()
-
-        audio_groups = sorted(df_run[AUDIO_COL].dropna().unique())
-        models_ordered = sorted(df_run['Model'].unique())
-        n_models = len(models_ordered)
-
-        # Normalised stacked bar chart per model
-        fig, axes = plt.subplots(1, n_models, figsize=(3.5 * n_models, 5), sharey=True)
-        if n_models == 1:
-            axes = [axes]
-
-        for ax, model in zip(axes, models_ordered):
-            sub = df_run[df_run['Model'] == model].dropna(subset=[AUDIO_COL])
-
-            counts = (sub.groupby([AUDIO_COL, 'Outcome'], observed=False)
-                        .size()
-                        .unstack(fill_value=0))
-            for col in ['Korrekt', 'Fehler']:
-                if col not in counts.columns:
-                    counts[col] = 0
-
-            counts_pct = counts.div(counts.sum(axis=1), axis=0) * 100
-            counts_pct = counts_pct[['Korrekt', 'Fehler']]
-
-            counts_pct.plot(
-                kind='bar', stacked=True, ax=ax,
-                color=['#2ca02c', '#d62728'],
-                edgecolor='white', linewidth=0.5,
-                legend=(ax == axes[-1])
-            )
-
-            for i, (grp, row) in enumerate(counts.iterrows()):
-                ax.text(i, 101, f'n={int(row.sum())}', ha='center', va='bottom',
-                        fontsize=7, color='gray')
-
-            ax.set_title(model, fontsize=10, fontweight='bold')
-            ax.set_xlabel('')
-            ax.set_xticklabels(ax.get_xticklabels(), rotation=0, fontsize=9)
-            ax.set_ylim(0, 115)
-            ax.axhline(50, color='gray', linewidth=0.8, linestyle='--', alpha=0.6)
-            if ax == axes[0]:
-                ax.set_ylabel('Anteil (%)', fontsize=10)
-            else:
-                ax.set_ylabel('')
-            if ax == axes[-1]:
-                ax.legend(loc='upper right', fontsize=8, title='Ergebnis')
-
-        fig.suptitle(f'{run_label} – Klassifikationsergebnis nach Audio-Präsenz',
-                     fontsize=12, fontweight='bold')
-        plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, f'Audio_StackedBar_{run_label}.png'),
-                    dpi=300, bbox_inches='tight')
-        plt.close()
-
-        # Metrics table per audio group
-        for model_name, model_df in df_run.groupby('base_model'):
-            for grp in audio_groups:
-                sub = model_df[model_df[AUDIO_COL] == grp]
-                if len(sub) < 3:
-                    continue
-                m = calculate_metrics(sub['y_true'], sub['y_pred'])
-                m.update({
-                    'Run': run_label,
-                    'Model': get_plot_label(model_name),
-                    'Audio': grp,
-                    'N': len(sub)
-                })
-                all_metrics.append(m)
-
-    if all_metrics:
-        df_out = pd.DataFrame(all_metrics)
-        cols_front = ['Run', 'Model', 'Audio', 'N',
-                      'Accuracy (%)', 'Precision (%)', 'Recall (%)', 'F1-Score (%)']
-        cols_front = [c for c in cols_front if c in df_out.columns]
-        df_out[cols_front].to_excel(
-            os.path.join(RESULTS_FOLDER, 'Audio_Metrics.xlsx'), index=False
-        )
-        print(f" -> Audio_Metrics.xlsx and plots saved to '{save_dir}'.")
-
 
 def run_inter_model_similarity(df_master):
     """Compute cross-model semantic similarity of justifications via SBERT.
@@ -2405,7 +2249,6 @@ if __name__ == "__main__":
         run_fairness_analysis(df_master)
         run_intra_model_consistency_check(df_master)
         run_inter_model_similarity(df_master)
-        run_audio_analysis(df_master)
         run_justification_deep_analysis(df_master)
         run_best_per_family_ensemble(df_master)
         run_worst_case_extraction(df_master)
