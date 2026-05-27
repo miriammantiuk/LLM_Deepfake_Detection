@@ -6,6 +6,8 @@
 §.jpg
 data/
 plots/
+archiv/
+frames/
 
 # Python
 __pycache__/
