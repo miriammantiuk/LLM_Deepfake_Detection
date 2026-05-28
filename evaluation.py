@@ -14,8 +14,8 @@ from sklearn.feature_extraction.text import CountVectorizer, ENGLISH_STOP_WORDS
 from sentence_transformers import SentenceTransformer, util
 import itertools
 import torch
-import plotly.express as px
-
+from sklearn.decomposition import PCA
+from matplotlib.lines import Line2D
 
 
 
@@ -1566,8 +1566,7 @@ def plot_model_comparison_heatmap(model_texts, clustered_df, save_folder, metric
     records = []
 
     for model_name, texts in model_texts.items():
-        groups = {k: v for k, v in texts.items()}
-        cv, matrices = _build_shared_vectorizer(groups)
+        cv, matrices = _build_shared_vectorizer(texts)
         if cv is None:
             continue
 
@@ -1639,8 +1638,7 @@ def plot_chapter_overview_heatmap(model_texts, clustered_df, save_folder):
     rate_tables = {m: {} for m in metrics}
 
     for model_name, texts in model_texts.items():
-        groups = {k: v for k, v in texts.items()}
-        cv, matrices = _build_shared_vectorizer(groups)
+        cv, matrices = _build_shared_vectorizer(texts)
         if cv is None:
             continue
 
@@ -1854,59 +1852,13 @@ def run_best_per_family_ensemble(df_master):
     Saves results to Excel and LaTeX.
     """
     print("\n=== Best-per-Family Ensemble (Per Run) ===")
-    
+
     # Derive family names from global display name mapping
     families = sorted(list(set(BASE_MODEL_DISPLAY_NAMES.values())))
     ensemble_results = []
+    top3_results = []
 
     all_runs = {r: d for r, d in iterate_runs(df_master)}
-
-    for run_label in RUN_SUFFIXES:
-        run_name = f"Run{run_label}"
-        df_run = all_runs.get(run_name)
-
-        if df_run is None: continue
-
-        print(f" -> Computing ensemble for {run_name}...")
-        best_models_tech = []
-        best_models_display = []
-        
-        for fam_name in families:
-            fam_df = df_run[df_run['base_model'].apply(lambda x: get_plot_label(x).startswith(fam_name))]
-            if fam_df.empty: continue
-            
-            best_f1 = -1
-            champion_tech = None
-            
-            for model_tech_name, model_data in fam_df.groupby('base_model'):
-                f1 = f1_score(model_data['y_true'], model_data['y_pred'], pos_label=1, zero_division=0)
-                if f1 > best_f1:
-                    best_f1 = f1
-                    champion_tech = model_tech_name
-            
-            if champion_tech:
-                best_models_tech.append(champion_tech)
-                best_models_display.append(get_plot_label(champion_tech))
-
-        if not best_models_tech: continue
-
-        # Ensemble (Majority Voting)
-        df_champions = df_run[df_run['base_model'].isin(best_models_tech)].copy()
-        ensemble_preds = df_champions.groupby('video_id')['y_pred'].mean()
-        ensemble_binary = (ensemble_preds > 0.5).astype(int)
-        
-        y_true_map = df_run.drop_duplicates('video_id').set_index('video_id')['y_true']
-        common_idx = ensemble_binary.index.intersection(y_true_map.index)
-        
-        metrics = calculate_metrics(y_true_map.loc[common_idx], ensemble_binary.loc[common_idx])
-        metrics.update({
-            'Run': run_name.replace('_', ' '),
-            'Models_Used_Display': ", ".join(best_models_display)
-        })
-        ensemble_results.append(metrics)
-
-    # ── TOP-3 BEST-PER-FAMILY ENSEMBLE ───────────────────────────────────────
-    top3_results = []
 
     for run_label in RUN_SUFFIXES:
         run_name = f"Run{run_label}"
@@ -1914,38 +1866,57 @@ def run_best_per_family_ensemble(df_master):
         if df_run is None:
             continue
 
-        print(f" -> Computing Top-3 Best-per-Family ensemble for {run_name}...")
+        print(f" -> Computing ensemble for {run_name}...")
 
-        # Find champion model per family and its F1 score
-        family_champions = []
+        # Find the best model per family (champion) — computed once, reused for both ensembles
+        family_champions = []  # [(tech_name, f1_score), ...]
         for fam_name in families:
-            fam_df = df_run[df_run['base_model'].apply(
-                lambda x: get_plot_label(x).startswith(fam_name))]
+            fam_df = df_run[df_run['base_model'].apply(lambda x: get_plot_label(x).startswith(fam_name))]
             if fam_df.empty:
                 continue
             best_f1, champion_tech = -1, None
             for model_tech_name, model_data in fam_df.groupby('base_model'):
-                f1 = f1_score(model_data['y_true'], model_data['y_pred'],
-                              pos_label=1, zero_division=0)
+                f1 = f1_score(model_data['y_true'], model_data['y_pred'], pos_label=1, zero_division=0)
                 if f1 > best_f1:
                     best_f1, champion_tech = f1, model_tech_name
             if champion_tech:
                 family_champions.append((champion_tech, best_f1))
 
-        # Keep only the top-3 families ranked by F1 score
-        family_champions.sort(key=lambda x: x[1], reverse=True)
-        top3_tech    = [m for m, _ in family_champions[:3]]
+        if not family_champions:
+            continue
+
+        # Ground truth map — shared by both ensemble evaluations
+        y_true_map = df_run.drop_duplicates('video_id').set_index('video_id')['y_true']
+
+        # ── BEST-PER-FAMILY ENSEMBLE (all families) ──────────────────────────
+        best_models_tech    = [m for m, _ in family_champions]
+        best_models_display = [get_plot_label(m) for m in best_models_tech]
+
+        df_champions    = df_run[df_run['base_model'].isin(best_models_tech)].copy()
+        ensemble_preds  = df_champions.groupby('video_id')['y_pred'].mean()
+        ensemble_binary = (ensemble_preds > 0.5).astype(int)
+        common_idx      = ensemble_binary.index.intersection(y_true_map.index)
+
+        metrics = calculate_metrics(y_true_map.loc[common_idx], ensemble_binary.loc[common_idx])
+        metrics.update({
+            'Run': run_name.replace('_', ' '),
+            'Models_Used_Display': ", ".join(best_models_display)
+        })
+        ensemble_results.append(metrics)
+
+        # ── TOP-3 BEST-PER-FAMILY ENSEMBLE ───────────────────────────────────
+        print(f" -> Computing Top-3 Best-per-Family ensemble for {run_name}...")
+
+        # Sort all family champions by F1 and keep only the top-3
+        top3_tech    = [m for m, _ in sorted(family_champions, key=lambda x: x[1], reverse=True)[:3]]
         top3_display = [get_plot_label(m) for m in top3_tech]
 
-        df_top3 = df_run[df_run['base_model'].isin(top3_tech)].copy()
-        ensemble_preds = df_top3.groupby('video_id')['y_pred'].mean()
+        df_top3         = df_run[df_run['base_model'].isin(top3_tech)].copy()
+        ensemble_preds  = df_top3.groupby('video_id')['y_pred'].mean()
         ensemble_binary = (ensemble_preds > 0.5).astype(int)
+        common_idx      = ensemble_binary.index.intersection(y_true_map.index)
 
-        y_true_map = df_run.drop_duplicates('video_id').set_index('video_id')['y_true']
-        common_idx = ensemble_binary.index.intersection(y_true_map.index)
-
-        metrics = calculate_metrics(y_true_map.loc[common_idx],
-                                    ensemble_binary.loc[common_idx])
+        metrics = calculate_metrics(y_true_map.loc[common_idx], ensemble_binary.loc[common_idx])
         metrics.update({
             'Run': run_name.replace('_', ' '),
             'Models_Used_Display': ", ".join(top3_display)
@@ -2104,8 +2075,6 @@ def run_inter_model_similarity(df_master):
         1. PCA scatter plot of all 20 variants (colour=family, shape=variant)
         2. 5x5 family cosine similarity heatmap (baseline models only)
     """
-    from sklearn.decomposition import PCA
-
     print("\n=== Inter-Model Semantic Similarity (SBERT) ===")
 
     # Marker shapes encode the prompt variant in the PCA scatter plot
@@ -2135,7 +2104,7 @@ def run_inter_model_similarity(df_master):
 
         valid_models = list(mean_embeddings.keys())
         if len(valid_models) < 2:
-            print(f" -> {run_label}: Zu wenige Modelle.")
+            print(f" -> {run_label}: Too few models.")
             continue
 
         emb_matrix = np.stack([mean_embeddings[m] for m in valid_models])
@@ -2161,7 +2130,6 @@ def run_inter_model_similarity(df_master):
                         fontsize=7.5, color=color)
 
         # Legend: prompt variants
-        from matplotlib.lines import Line2D
         legend_variants = [
             Line2D([0], [0], marker=m, color='gray', linestyle='None',
                    markersize=8, label=f'Baseline{v}' if v == '' else v)
@@ -2182,7 +2150,6 @@ def run_inter_model_similarity(df_master):
         print(f" -> {run_label}: PCA scatter saved.")
 
         # Plot 2: 5x5 family cosine similarity heatmap (baseline models only)
-        families = sorted(set(BASE_MODEL_DISPLAY_NAMES.values()))
         baseline_keys = {v: k for k, v in BASE_MODEL_DISPLAY_NAMES.items()
                          if '_indicators' not in k and '_thinking' not in k}
 
@@ -2253,4 +2220,4 @@ if __name__ == "__main__":
         run_best_per_family_ensemble(df_master)
         run_worst_case_extraction(df_master)
         
-    print("\n=== Fertig ===")
+    print("\n=== Finished ===")
