@@ -1,3 +1,6 @@
+# ---------------------------------------------------------
+# evaluation.py — Analysis, visualisation and export functions
+# ---------------------------------------------------------
 import pandas as pd
 import json
 import glob
@@ -7,40 +10,21 @@ import cv2
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import chi2_contingency, fisher_exact
-from sklearn.metrics import (accuracy_score, f1_score, precision_score, 
-                             recall_score, confusion_matrix, roc_auc_score, roc_curve, auc)
+from sklearn.metrics import f1_score, accuracy_score, confusion_matrix, roc_curve, auc
 import re
-from sklearn.feature_extraction.text import CountVectorizer, ENGLISH_STOP_WORDS
+from sklearn.feature_extraction.text import CountVectorizer
 from sentence_transformers import SentenceTransformer, util
 import itertools
 import torch
 from sklearn.decomposition import PCA
 from matplotlib.lines import Line2D
 
-
+from config import *
+from metrics import calculate_metrics, get_word_count
 
 # ---------------------------------------------------------
-# GLOBAL CONFIGURATION
+# HELPER FUNCTIONS
 # ---------------------------------------------------------
-JSON_FOLDER = '.'
-INFO_DATEI = 'dataset_info.xlsx'
-VIDEO_SOURCE_PATH = r'data\processed'
-RESULTS_FOLDER = 'results'
-SUMMARIZED_FILE = os.path.join(RESULTS_FOLDER, 'results_summarized.xlsx')
-
-# ========== BASE MODEL NAMES ==========
-BASE_MODEL_DISPLAY_NAMES = {
-    'gemini-3-flash-preview': 'Gemini 3 Flash',
-    'gpt5_2_instant': 'GPT 5.2',
-    'gpt5_2': 'GPT 5.2',
-    'qwen3.5-397b-a17b': 'Qwen 3.5',
-    'kimi-k2.5': 'Kimi k2.5',
-    'seed-2.0-lite': 'Seed 2.0 Lite'
-}
-
-# ========== VARIANT ORDER ==========
-# Ordering of prompt variants used in all tables and plots
-VARIANT_ORDER = ['', '+I', '+T', '+I+T']
 
 # Centralised colour palette: ensures consistent styling across all plots
 def get_model_color(model_name):
@@ -81,18 +65,6 @@ def get_model_color(model_name):
     
     return palettes[family][variant]
 
-# Shared list constants
-RUN_SUFFIXES = ["_1", "_2", "_3"]
-META_COLS = ['dataset', 'gender', 'video_length','deepfake_category','deepfake_type', 'audio']
-
-# Global plot style
-sns.set_style("whitegrid")
-plt.rcParams.update({'figure.max_open_warning': 0}) 
-
-# Top-level output directory for all plots
-base_plot_folder = 'plots'
-os.makedirs(base_plot_folder, exist_ok=True)
-os.makedirs(RESULTS_FOLDER, exist_ok=True)
 
 
 # Domain-specific stop words for keyword analysis (extends sklearn English stop words) 
@@ -233,40 +205,6 @@ def run_baseline_distribution_analysis(df_master, save_folder="Baseline_Distribu
         print(f" -> Distribution plot for '{feat}' saved.")
 
     print("=== Baseline Analysis complete. ===\n")
-
-def calculate_metrics(y_true, y_pred, y_prob=None):
-    if len(y_true) == 0:
-        return {'Accuracy (%)': 0, 'Precision (%)': 0, 'Recall (%)': 0, 'F1-Score (%)': 0, 'ROC AUC': 'N/A', 'TN': 0, 'FP': 0, 'FN': 0, 'TP': 0}
-
-    acc = accuracy_score(y_true, y_pred)
-    precision = precision_score(y_true, y_pred, pos_label=1, zero_division=0)
-    recall = recall_score(y_true, y_pred, pos_label=1, zero_division=0)
-    f1 = f1_score(y_true, y_pred, pos_label=1, zero_division=0)
-
-    cm = confusion_matrix(y_true, y_pred, labels=[0,1])
-    tn, fp, fn, tp = cm.ravel()
-    
-    roc_auc = None
-    if y_prob is not None:
-        try:
-            if len(np.unique(y_true)) > 1:
-                roc_auc = roc_auc_score(y_true, y_prob)
-        except ValueError:
-            roc_auc = None 
-
-    return {
-        'Accuracy (%)': round(acc * 100, 1),
-        'Precision (%)': round(precision * 100, 1),
-        'Recall (%)': round(recall * 100, 1),
-        'F1-Score (%)': round(f1 * 100, 1),
-        'ROC AUC': round(roc_auc, 1) if roc_auc is not None else 'N/A',
-        'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp
-    }
-
-def get_word_count(val):
-    if isinstance(val, list): return len(" ".join(str(v) for v in val).split())
-    elif isinstance(val, str): return len(val.split())
-    return 0
 
 def get_plot_label(model_name):
     """Convert a technical model name to a human-readable plot label.
@@ -2077,9 +2015,6 @@ def run_inter_model_similarity(df_master):
     """
     print("\n=== Inter-Model Semantic Similarity (SBERT) ===")
 
-    # Marker shapes encode the prompt variant in the PCA scatter plot
-    VARIANT_MARKERS = {'': 'o', '+I': 's', '+T': '^', '+I+T': 'D'}
-
     for run_label, df_run in iterate_runs(df_master):
         save_dir = os.path.join(base_plot_folder, run_label)
         os.makedirs(save_dir, exist_ok=True)
@@ -2118,7 +2053,7 @@ def run_inter_model_similarity(df_master):
         coords = pca.fit_transform(emb_matrix)
         var_explained = pca.explained_variance_ratio_ * 100
 
-        fig, ax = plt.subplots(figsize=(10, 8))
+        _, ax = plt.subplots(figsize=(10, 8))
 
         for i, (label, color, variant) in enumerate(zip(labels, colors, variants)):
             marker = VARIANT_MARKERS.get(variant, 'o')
@@ -2172,7 +2107,7 @@ def run_inter_model_similarity(df_master):
 
         df_fam = pd.DataFrame(sim_fam, index=fam_names, columns=fam_names)
 
-        fig, ax = plt.subplots(figsize=(7, 5))
+        _, ax = plt.subplots(figsize=(7, 5))
         sns.heatmap(df_fam, annot=True, fmt='.2f', cmap='YlOrRd',
                     vmin=0.5, vmax=1.0, linewidths=0.5,
                     cbar_kws={'label': 'Kosinus-Ähnlichkeit'}, ax=ax)
@@ -2187,37 +2122,3 @@ def run_inter_model_similarity(df_master):
         plt.close()
         print(f" -> {run_label}: Family heatmap saved.")
 
-
-# ---------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------
-if __name__ == "__main__":
-    
-    # Raw Data Extraction & Aggregation 
-    for s in RUN_SUFFIXES: run_analysis(s)
-    run_aggregation_and_benchmark()
-    
-    df_ground_truth = pd.read_excel(INFO_DATEI)
-    run_baseline_distribution_analysis(df_ground_truth)
-
-    # Load master dataset once and pass to all analysis functions
-    df_master = load_master_data()
-    
-    if df_master is not None:
-
-        # --- GLOBAL / AGGREGATED ANALYSES ---
-        run_global_baseline_roc_analysis(df_master)   
-        run_family_variant_roc_comparison(df_master)
-        
-        # --- PER-RUN ANALYSES ---
-        generate_plots(df_master) 
-        run_feature_importance_analysis(df_master)
-        run_feature_analysis(df_master)
-        run_fairness_analysis(df_master)
-        run_intra_model_consistency_check(df_master)
-        run_inter_model_similarity(df_master)
-        run_justification_deep_analysis(df_master)
-        run_best_per_family_ensemble(df_master)
-        run_worst_case_extraction(df_master)
-        
-    print("\n=== Finished ===")
