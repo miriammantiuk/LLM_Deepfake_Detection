@@ -19,6 +19,8 @@ import torch
 from sklearn.decomposition import PCA
 from matplotlib.lines import Line2D
 
+from functools import lru_cache
+
 from config import *
 from metrics import calculate_metrics, get_word_count
 
@@ -125,14 +127,11 @@ KEYWORD_HIERARCHY = {
 }
 
 # Load SBERT model shared across all semantic analysis functions
-_model_sbert = None
-
+@lru_cache(maxsize=1)
 def get_sbert():
-    global _model_sbert
-    if _model_sbert is None:
-        print(" -> Loading SBERT model (all-MiniLM-L6-v2)...")
-        _model_sbert = SentenceTransformer('all-MiniLM-L6-v2')
-    return _model_sbert
+    """Load and cache the SBERT model (loaded once on first call)."""
+    print(" -> Loading SBERT model (all-MiniLM-L6-v2)...")
+    return SentenceTransformer('all-MiniLM-L6-v2')
 
 # ---------------------------------------------------------
 # HELPER FUNCTIONS
