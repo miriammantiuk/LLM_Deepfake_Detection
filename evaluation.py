@@ -1,26 +1,29 @@
 # ---------------------------------------------------------
 # evaluation.py — Analysis, visualisation and export functions
 # ---------------------------------------------------------
-import pandas as pd
+# Standard library
 import json
 import glob
 import os
+import re
+import itertools
+from functools import lru_cache
+
+# Third-party
+import pandas as pd
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 import seaborn as sns
+import torch
 from scipy.stats import chi2_contingency, fisher_exact
 from sklearn.metrics import f1_score, accuracy_score, confusion_matrix, roc_curve, auc
-import re
 from sklearn.feature_extraction.text import CountVectorizer
-from sentence_transformers import SentenceTransformer, util
-import itertools
-import torch
 from sklearn.decomposition import PCA
 from matplotlib.lines import Line2D
+from sentence_transformers import SentenceTransformer, util
 
-from functools import lru_cache
-
+# Local
 from config import *
 from metrics import calculate_metrics, get_word_count
 
@@ -245,10 +248,16 @@ def get_plot_label(model_name):
 # ---------------------------------------------------------
 
 def run_analysis(suffix=""):
-    output_datei = os.path.join(RESULTS_FOLDER, f'results{suffix}.xlsx')
+    """Parse JSON result files for one run and export to Excel.
+
+    Loads all JSON files matching the given suffix, maps assessment strings
+    to binary y_pred labels, computes justification word counts, and writes
+    a combined Excel file to the results folder.
+    """
+    output_file = os.path.join(RESULTS_FOLDER, f'results{suffix}.xlsx')
     print(f"--- JSON extraction for {suffix} ---")
     json_files = glob.glob(os.path.join(JSON_FOLDER, f'*{suffix}.json'))
-    
+
     if not json_files: return
 
     all_data = []
@@ -266,10 +275,10 @@ def run_analysis(suffix=""):
 
     if not all_data: return
 
-    df_gesamt = pd.concat(all_data, ignore_index=True)
-    df_gesamt['y_pred'] = df_gesamt['assessment'].map({"Real": 0, "real": 0, "Fake": 1, "fake": 1, 0: 0, 1: 1})
-    df_gesamt.to_excel(output_datei, index=False)
-    print(f" saved: {output_datei}")
+    df_all = pd.concat(all_data, ignore_index=True)
+    df_all['y_pred'] = df_all['assessment'].map({"Real": 0, "real": 0, "Fake": 1, "fake": 1, 0: 0, 1: 1})
+    df_all.to_excel(output_file, index=False)
+    print(f" saved: {output_file}")
 
 def run_aggregation_and_benchmark():
     """Aggregate per-run result files and compute benchmark metrics.
@@ -590,8 +599,14 @@ def iterate_runs(df_master):
 # ---------------------------------------------------------
 
 def generate_plots(df_master):
+    """Generate confusion matrices and ROC curves for every model and run.
+
+    Creates one confusion matrix heatmap and, where probability scores are
+    available, one ROC curve per model. Saves all plots to the per-run
+    subdirectory under the base plot folder.
+    """
     print("\n=== Generating Plots (Per Run) ===")
-    
+
     for run_label, df_run in iterate_runs(df_master):
         print(f"Plots for {run_label}...")
         run_folder = os.path.join(base_plot_folder, run_label)
@@ -886,14 +901,18 @@ def run_feature_importance_analysis(df_master):
 
 
 def run_feature_analysis(df_master):
+    """Compute and plot per-model F1 scores broken down by each metadata feature.
+
+    Iterates over all runs, models, and META_COLS features. Groups with fewer
+    than 5 videos are skipped. Exports a combined Excel file and saves bar
+    charts (≤3 groups) or heatmaps (>3 groups) per run and feature.
+    """
     print("\n=== Feature Analysis (Per Run) ===")
     all_results = []
-    
-    features_to_analyze = META_COLS 
-    
+
     for run_label, df_run in iterate_runs(df_master):
         for model_name, model_df in df_run.groupby('base_model'):
-            for feat in features_to_analyze:
+            for feat in META_COLS:
                 if feat not in model_df.columns: continue
                 
                 for group_name, grp_data in model_df.groupby(feat, observed=False):
@@ -964,9 +983,16 @@ def run_feature_analysis(df_master):
                     print(f" [WARN] Feature plot for '{feat}' failed: {e}")
 
 def run_fairness_analysis(df_master):
+    """Test whether model performance differs significantly across demographic groups.
+
+    For each run, model, and META_COLS feature, computes per-group accuracy and
+    applies Fisher's Exact Test (small groups) or Chi² (larger groups) to detect
+    statistically significant disparities. Exports results to Excel and saves
+    grouped bar plots per feature.
+    """
     print("\n=== Fairness Analysis (Per Run) ===")
     all_results = []
-    
+
     for run_label, df_run in iterate_runs(df_master):
         print(f" -> {run_label}...")
         for model_name, model_df in df_run.groupby('base_model'):
@@ -1299,9 +1325,10 @@ def cluster_keywords(inventory_df, output_filename='keyword_inventory_clustered.
 
 def _build_shared_vectorizer(groups: dict, max_features=150):
     """Fit a shared CountVectorizer on TP+FP texts, then transform all groups.
-
-    Vocabulary is driven by TP and FP texts (analytically most relevant).
-    FN and TN are subsequently transformed with the same vocabulary.
+    METHODOLOGY: 
+    The vectorizer is intentionally fitted exclusively on TP and FP texts, as these 
+    represent the most analytically relevant cases for hallucination detection (deepfake indicators). 
+    FN/TN are subsequently transformed into this established vector space.
     """
     # Fit vocabulary on TP+FP texts 
     fit_texts = groups.get('TP', []) + groups.get('FP', [])
@@ -1929,7 +1956,7 @@ def run_worst_case_extraction(df_master):
         df_run['is_correct'] = (df_run['y_pred'] == df_run['y_true']).astype(int)
         pivot = df_run.pivot(index='video_id', columns='base_model', values='is_correct')
 
-        model_cols = [c for c in pivot.columns]
+        model_cols = list(pivot.columns)
         pivot['correct_count'] = pivot[model_cols].sum(axis=1)
         pivot['total_models']  = len(model_cols)
         pivot['failure_rate']  = 1.0 - (pivot['correct_count'] / pivot['total_models'])
