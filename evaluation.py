@@ -17,6 +17,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import torch
 from scipy.stats import chi2_contingency, fisher_exact
+from statsmodels.stats.contingency_tables import cochrans_q, mcnemar
+from statsmodels.stats.multitest import multipletests
 from sklearn.metrics import f1_score, accuracy_score, confusion_matrix, roc_curve, auc
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.decomposition import PCA
@@ -2147,4 +2149,204 @@ def run_inter_model_similarity(df_master):
                     dpi=300, bbox_inches='tight')
         plt.close()
         print(f" -> {run_label}: Family heatmap saved.")
+
+
+def run_significance_tests(df_master):
+    """Test whether LLMs and prompt variants differ significantly in classification accuracy.
+
+    Uses Cochran's Q (omnibus) + pairwise McNemar post-hoc (Holm correction).
+    Binary outcome per video: majority-vote correct/incorrect across all 3 runs.
+
+    Test 1 — Baseline LLMs: compares all baseline models against each other.
+    Test 2 — Prompt Variants: compares Baseline / +I / +T / +I+T within each family.
+
+    Exports results to significance_tests.xlsx and four LaTeX tables.
+    """
+    print("\n=== Significance Tests (Cochran's Q + McNemar Post-hoc) ===")
+
+    # --- Step 1: Majority vote per video × model ---
+    pred_cols = [f'y_pred{s}' for s in RUN_SUFFIXES]
+    available = [c for c in pred_cols if c in df_master.columns]
+
+    if len(available) < 2:
+        print(" ERROR: Need at least 2 run columns for majority vote.")
+        return
+
+    df = df_master[['video_id', 'base_model', 'y_true'] + available].copy()
+    df = df.dropna(subset=['y_true'] + available)
+
+    # Majority vote: >= 2 out of 3 runs must agree
+    n_runs = len(available)
+    df['y_vote'] = (df[available].sum(axis=1) > n_runs / 2).astype(int)
+    df['correct'] = (df['y_vote'] == df['y_true']).astype(int)
+
+    # Pivot: rows = video_id, columns = base_model, values = correct (0/1)
+    pivot = df.pivot_table(index='video_id', columns='base_model', values='correct')
+
+    # --- Helper: sort model keys by canonical variant order ---
+    def _variant_sort_key(model_key):
+        label = get_plot_label(model_key)
+        for v in ['+I+T', '+T', '+I', '']:  # longest first so '' doesn't swallow others
+            if label.endswith(v):
+                return VARIANT_ORDER.index(v) if v in VARIANT_ORDER else len(VARIANT_ORDER)
+        return len(VARIANT_ORDER)
+
+    # --- Helper: Cochran's Q ---
+    def _cochrans_q(mat, names):
+        sub = mat[names].dropna()
+        if sub.shape[1] < 2 or sub.shape[0] < 5:
+            return None, None
+        try:
+            result = cochrans_q(sub.values)
+            stat = float(result.statistic)
+            pval = float(result.pvalue)
+        except Exception as e:
+            print(f"  WARNING: Cochran's Q failed ({e})")
+            return None, None
+
+        sig = '***' if pval < 0.001 else '**' if pval < 0.01 else '*' if pval < 0.05 else 'n.s.'
+        return {
+            'Q': round(stat, 3),
+            'df': int(sub.shape[1] - 1),
+            'p': round(pval, 4),
+            'N': int(sub.shape[0]),
+            'sig': sig,
+        }, sub
+
+    # --- Helper: pairwise McNemar + Holm ---
+    def _mcnemar_posthoc(sub, names):
+        pairs = list(itertools.combinations(range(len(names)), 2))
+        raw_ps, labels = [], []
+
+        for i, j in pairs:
+            a = sub.iloc[:, i].values.astype(int)
+            b = sub.iloc[:, j].values.astype(int)
+            n10 = int(((a == 1) & (b == 0)).sum())
+            n01 = int(((a == 0) & (b == 1)).sum())
+            table = [[int(((a == 1) & (b == 1)).sum()), n10],
+                     [n01,                               int(((a == 0) & (b == 0)).sum())]]
+            use_exact = (n10 + n01) < 25
+            res = mcnemar(table, exact=use_exact, correction=(not use_exact))
+            raw_ps.append(float(res.pvalue))
+            labels.append(f"{names[i]} vs {names[j]}")
+
+        if not raw_ps:
+            return pd.DataFrame()
+
+        _, p_adj, _, _ = multipletests(raw_ps, method='holm')
+        return pd.DataFrame({
+            'Comparison':   labels,
+            'p_raw':        [round(p, 4) for p in raw_ps],
+            'p_adj (Holm)': [round(p, 4) for p in p_adj],
+            'sig':          ['***' if p < 0.001 else '**' if p < 0.01 else '*' if p < 0.05 else 'n.s.'
+                             for p in p_adj],
+        })
+
+    # --- Helper: accuracy per model from majority vote ---
+    def _accuracy_row(keys, names):
+        accs = {}
+        for k, n in zip(keys, names):
+            col = pivot[k].dropna()
+            accs[n] = round(float(col.mean()) * 100, 1)
+        return accs
+
+    # ======================================================
+    # TEST 1: Baseline LLMs
+    # ======================================================
+    print("\n--- Test 1: Baseline LLMs ---")
+
+    bl_keys = sorted(
+        [k for k in BASE_MODEL_DISPLAY_NAMES
+         if '_indicators' not in k and '_thinking' not in k and k in pivot.columns],
+        key=lambda x: get_plot_label(x)
+    )
+    bl_names = [get_plot_label(k) for k in bl_keys]
+
+    mat_llm = pivot[bl_keys].rename(columns=dict(zip(bl_keys, bl_names)))
+    q_llm, sub_llm = _cochrans_q(mat_llm, bl_names)
+    ph_llm = _mcnemar_posthoc(sub_llm, bl_names) if sub_llm is not None else pd.DataFrame()
+
+    if q_llm:
+        print(f"  Q = {q_llm['Q']}, df = {q_llm['df']}, p = {q_llm['p']}, "
+              f"N = {q_llm['N']}  [{q_llm['sig']}]")
+        acc_llm = _accuracy_row(bl_keys, bl_names)
+        print(f"  Accuracy (majority vote): {acc_llm}")
+
+    # ======================================================
+    # TEST 2: Prompt Variants per Family
+    # ======================================================
+    print("\n--- Test 2: Prompt Variants per Family ---")
+
+    families = sorted(set(BASE_MODEL_DISPLAY_NAMES.values()))
+    q_var_rows, ph_var_list = [], []
+
+    for fam in families:
+        fam_keys = sorted(
+            [k for k in pivot.columns if get_plot_label(k).startswith(fam)],
+            key=_variant_sort_key
+        )
+        fam_names = [get_plot_label(k) for k in fam_keys]
+
+        if len(fam_keys) < 2:
+            print(f"  {fam}: only {len(fam_keys)} variant(s) — skipped.")
+            continue
+
+        mat_var = pivot[fam_keys].rename(columns=dict(zip(fam_keys, fam_names)))
+        q_res, sub_var = _cochrans_q(mat_var, fam_names)
+
+        if q_res:
+            q_res['Family'] = fam
+            q_var_rows.append(q_res)
+            print(f"  {fam}: Q = {q_res['Q']}, df = {q_res['df']}, "
+                  f"p = {q_res['p']}, N = {q_res['N']}  [{q_res['sig']}]")
+
+        ph = _mcnemar_posthoc(sub_var, fam_names) if sub_var is not None else pd.DataFrame()
+        if not ph.empty:
+            ph.insert(0, 'Family', fam)
+            ph_var_list.append(ph)
+
+    # ======================================================
+    # EXPORT: Excel
+    # ======================================================
+    excel_path = os.path.join(RESULTS_FOLDER, 'significance_tests.xlsx')
+    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+        if q_llm:
+            df_q_llm = pd.DataFrame([q_llm])
+            df_q_llm.insert(0, 'Models', ', '.join(bl_names))
+            df_q_llm.to_excel(writer, sheet_name='CochransQ_LLMs', index=False)
+        if not ph_llm.empty:
+            ph_llm.to_excel(writer, sheet_name='McNemar_LLMs', index=False)
+        if q_var_rows:
+            # Reorder columns: Family first
+            df_q_var = pd.DataFrame(q_var_rows)[['Family', 'Q', 'df', 'p', 'N', 'sig']]
+            df_q_var.to_excel(writer, sheet_name='CochransQ_Variants', index=False)
+        if ph_var_list:
+            pd.concat(ph_var_list, ignore_index=True).to_excel(
+                writer, sheet_name='McNemar_Variants', index=False)
+
+    print(f"\n -> Excel saved: {excel_path}")
+
+    # ======================================================
+    # EXPORT: LaTeX
+    # ======================================================
+    def _to_latex(df_in, filename, col_fmt):
+        df_l = df_in.copy()
+        df_l.columns = [c.replace('_', r'\_') for c in df_l.columns]
+        df_l.to_latex(os.path.join(RESULTS_FOLDER, filename),
+                      index=False, escape=False, column_format=col_fmt)
+        print(f" -> LaTeX saved: {filename}")
+
+    if q_llm:
+        _to_latex(pd.DataFrame([{k: v for k, v in q_llm.items()}]),
+                  'sig_cochransq_llms.tex', 'ccccc')
+    if not ph_llm.empty:
+        _to_latex(ph_llm, 'sig_mcnemar_llms.tex', 'lcccl')
+    if q_var_rows:
+        _to_latex(pd.DataFrame(q_var_rows)[['Family', 'Q', 'df', 'p', 'N', 'sig']],
+                  'sig_cochransq_variants.tex', 'lccccc')
+    if ph_var_list:
+        _to_latex(pd.concat(ph_var_list, ignore_index=True),
+                  'sig_mcnemar_variants.tex', 'llcccl')
+
+    print("=== Significance Tests complete. ===")
 

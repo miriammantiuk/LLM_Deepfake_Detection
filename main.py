@@ -20,6 +20,7 @@ from evaluation import (
     run_justification_deep_analysis,
     run_best_per_family_ensemble,
     run_worst_case_extraction,
+    run_significance_tests,
 )
 
 if __name__ == "__main__":
@@ -38,18 +39,19 @@ if __name__ == "__main__":
     if df_master is not None:
 
         # --- GLOBAL / AGGREGATED ANALYSES ---
-        run_global_baseline_roc_analysis(df_master)
-        run_family_variant_roc_comparison(df_master)
+        #run_global_baseline_roc_analysis(df_master)
+        #run_family_variant_roc_comparison(df_master)
 
         # --- PER-RUN ANALYSES ---
-        generate_plots(df_master)
-        run_feature_importance_analysis(df_master)
-        run_feature_analysis(df_master)
-        run_fairness_analysis(df_master)
-        run_intra_model_consistency_check(df_master)
-        run_inter_model_similarity(df_master)
-        run_justification_deep_analysis(df_master)
-        run_best_per_family_ensemble(df_master)
-        run_worst_case_extraction(df_master)
+        #generate_plots(df_master)
+        #run_feature_importance_analysis(df_master)
+        #run_feature_analysis(df_master)
+        #run_fairness_analysis(df_master)
+        #run_intra_model_consistency_check(df_master)
+        #run_inter_model_similarity(df_master)
+        #run_justification_deep_analysis(df_master)
+        #run_best_per_family_ensemble(df_master)
+        #run_worst_case_extraction(df_master)
+        run_significance_tests(df_master)
 
     print("\n=== Finished ===")

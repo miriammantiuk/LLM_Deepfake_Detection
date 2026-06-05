@@ -24,6 +24,7 @@ openpyxl>=3.1.2
 # ----- Evaluation pipeline: statistics & ML -----
 scipy>=1.13.0
 scikit-learn>=1.4.0
+statsmodels>=0.14.6
 
 # ----- Evaluation pipeline: visualisation -----
 matplotlib>=3.8.0
