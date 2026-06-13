@@ -1,5 +1,5 @@
 # ---------------------------------------------------------
-# evaluation.py — Analysis, visualisation and export functions
+# evaluation.py Analysis, visualisation and export functions
 # ---------------------------------------------------------
 # Standard library
 import json
@@ -620,7 +620,7 @@ def generate_plots(df_master):
             plt.figure(figsize=(5, 4))
             sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False, xticklabels=['Real', 'Fake'], yticklabels=['Real', 'Fake'])
             plot_label = get_plot_label(model_name)
-            plt.title(f'CM: {plot_label}')
+            plt.title(f'Konfusionsmatrix: {plot_label}')
             plt.tight_layout()
             plt.savefig(os.path.join(run_folder, f'CM_{model_name}.png'))
             plt.close()
@@ -632,7 +632,7 @@ def generate_plots(df_master):
                 fpr, tpr, _ = roc_curve(group['y_true'], y_prob)
                 roc_auc_val = auc(fpr, tpr)
                 plt.figure(figsize=(6, 6))
-                plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc_val:.2f})')
+                plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC-Kurve (AUC = {roc_auc_val:.2f})')
                 plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
                 plt.xlim([0.0, 1.0])
                 plt.ylim([0.0, 1.05])
@@ -649,7 +649,7 @@ def run_global_baseline_roc_analysis(df_master):
     print("\n=== Global Baseline ROC Analysis (Aggregated) ===")
     
     plt.figure(figsize=(10, 8))
-    plt.plot([0, 1], [0, 1], color='gray', lw=1, linestyle='--', label='Random Guessing (AUC = 0.5)')
+    plt.plot([0, 1], [0, 1], color='gray', lw=1, linestyle='--', label='Zufallsniveau (AUC = 0.5)')
     
     agg_folder = os.path.join(base_plot_folder, 'Aggregated')
     os.makedirs(agg_folder, exist_ok=True)
@@ -691,7 +691,7 @@ def run_global_baseline_roc_analysis(df_master):
         plt.ylim([0.0, 1.05])
         plt.xlabel('False Positive Rate (FPR)', fontsize=12)
         plt.ylabel('True Positive Rate (TPR / Recall)', fontsize=12)
-        plt.title('Baseline ROC', fontsize=14, fontweight='bold')
+        plt.title('ROC: Basis-Modelle', fontsize=14, fontweight='bold')
         plt.legend(loc="lower right", fontsize=10)
         plt.grid(alpha=0.3)
         plt.tight_layout()
@@ -718,7 +718,7 @@ def run_family_variant_roc_comparison(df_master):
     
     for fam in all_families:
         plt.figure(figsize=(8, 7))
-        plt.plot([0, 1], [0, 1], color='gray', lw=1, linestyle='--', label='Random')
+        plt.plot([0, 1], [0, 1], color='gray', lw=1, linestyle='--', label='Zufallsniveau')
         
         has_plot_data = False
         
@@ -964,11 +964,11 @@ def run_feature_analysis(df_master):
                         )
 
                         
-                        plt.title(f'{run_label}: {feat} Performance')
+                        plt.title(f'{run_label}: {feat} – F1-Score nach Gruppe')
                         plt.ylabel('F1-Score (%)')
                         plt.xlabel('')
                         plt.ylim(0, 100)
-                        plt.legend(title='Model', bbox_to_anchor=(1.05, 1), loc='upper left')
+                        plt.legend(title='Modell', bbox_to_anchor=(1.05, 1), loc='upper left')
                         plt.grid(axis='y', linestyle='--', alpha=0.7)
                         plt.tight_layout()
                         plt.savefig(os.path.join(run_folder, f'Feature_Analysis_{feat}_Bar.png'))
@@ -977,7 +977,7 @@ def run_feature_analysis(df_master):
                     else:
                         plt.figure(figsize=(10, len(pivot)*0.5 + 2))
                         sns.heatmap(pivot, annot=True, cmap='RdYlGn', fmt='.1f', vmin=0, vmax=100)
-                        plt.title(f'{run_label}: {feat} Performance')
+                        plt.title(f'{run_label}: {feat} – F1-Score nach Gruppe')
                         plt.tight_layout()
                         plt.savefig(os.path.join(run_folder, f'Feature_Analysis_{feat}_Heatmap.png'))
                         plt.close()
@@ -1039,7 +1039,7 @@ def run_fairness_analysis(df_master):
                     pivot.index = [get_plot_label(model) for model in pivot.index]
                     plt.figure(figsize=(10, len(pivot)*0.5 + 2))
                     sns.heatmap(pivot, annot=True, cmap='RdBu', center=0, fmt='.1f')
-                    plt.title(f'{run_label}: Bias by {feat}')
+                    plt.title(f'{run_label}: Verzerrung nach {feat}')
                     plt.tight_layout()
                     plt.savefig(os.path.join(run_folder, f'Fairness_Bias_{feat}.png'))
                     plt.close()
@@ -1121,8 +1121,8 @@ def run_intra_model_consistency_check(df_master):
     # Plot 1: distribution of consistency scores
     plt.figure(figsize=(10, 6))
     sns.boxplot(data=df_res, x='plot_label', y='Consistency_Score', hue='Consistency_Score', palette="Blues", legend=False)
-    plt.title('Reasoning Stability Distribution (SBERT)')
-    plt.ylabel('Consistency Score')
+    plt.title('Konsistenz der Begründungen: Verteilung (SBERT)')
+    plt.ylabel('Konsistenz-Score')
     plt.ylim(0, 1.1)
     plt.xticks(rotation=45)
     plt.tight_layout()
@@ -1137,8 +1137,8 @@ def run_intra_model_consistency_check(df_master):
     
     plt.bar(x_pos, summary['mean'], yerr=summary['std'], align='center', alpha=0.8, ecolor='black', capsize=10, color=model_colors)
     plt.xticks(x_pos, summary.index, rotation=45)
-    plt.ylabel('Mean Semantic Consistency (0-1)')
-    plt.title('Model Reasoning Stability (Mean ± Std Dev)')
+    plt.ylabel('Mittlere semantische Konsistenz (0–1)')
+    plt.title('Vorhersage-Stabilität der Modelle (Mittelwert ± Std.-Abw.)')
     plt.ylim(0, 1.1)
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     plt.tight_layout()
@@ -1901,9 +1901,23 @@ def run_best_per_family_ensemble(df_master):
         # Generate LaTeX tables
         # Helper: DataFrame to .tex file
         def _to_latex_file(df_in, filename, caption, label):
+            metric_cols = ['F1-Score (%)', 'Accuracy (%)', 'Precision (%)', 'Recall (%)']
             df_l = df_in[cols_latex].copy()
-            for col in ['F1-Score (%)', 'Accuracy (%)', 'Precision (%)', 'Recall (%)']:
+
+            # Compute mean ± std across runs before formatting individual values
+            mean_std_row = {'Run': r'\textit{Mean $\pm$ SD}', 'LLMs': ''}
+            for col in metric_cols:
+                m = pd.to_numeric(df_l[col], errors='coerce').mean()
+                s = pd.to_numeric(df_l[col], errors='coerce').std()
+                mean_std_row[col] = f"{m:.1f} $\\pm$ {s:.1f}".replace('.', ',')
+
+            # Format individual run values
+            for col in metric_cols:
                 df_l[col] = df_l[col].map(lambda x: f"{x:.1f}".replace('.', ','))
+
+            # Append mean ± std row
+            df_l = pd.concat([df_l, pd.DataFrame([mean_std_row])], ignore_index=True)
+
             df_l.columns = [c.replace('%', r'\%').replace('_', r'\_')
                             for c in df_l.columns]
             df_l.to_latex(
@@ -1917,7 +1931,7 @@ def run_best_per_family_ensemble(df_master):
             print(f" -> LaTeX table saved: {filename}")
 
         cols_latex = ['Run', 'F1-Score (%)', 'Accuracy (%)',
-                      'Precision (%)', 'Recall (%)', 'Models_Used_Display']
+                      'Precision (%)', 'Recall (%)', 'LLMs']
 
         # Best-per-Family
         _to_latex_file(
@@ -2103,7 +2117,7 @@ def run_inter_model_similarity(df_master):
 
         ax.set_xlabel(f'PC1 ({var_explained[0]:.1f}% Varianz)', fontsize=10)
         ax.set_ylabel(f'PC2 ({var_explained[1]:.1f}% Varianz)', fontsize=10)
-        ax.set_title(f'{run_label}: Semantische Ähnlichkeit der Justifications (PCA)',
+        ax.set_title(f'{run_label}: Semantische Ähnlichkeit der Begründungen (PCA)',
                      fontsize=12, fontweight='bold')
         ax.grid(alpha=0.3)
         plt.tight_layout()

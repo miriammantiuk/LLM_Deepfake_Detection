@@ -112,4 +112,14 @@ KEYWORD_HIERARCHY = {
 # GLOBAL PLOT STYLE
 # ---------------------------------------------------------
 sns.set_style("whitegrid")
-plt.rcParams.update({'figure.max_open_warning': 0})
+plt.rcParams.update({
+    'figure.max_open_warning': 0,
+    'font.family':      'sans-serif',
+    'font.sans-serif':  ['Arial'],
+    'font.size':        11,
+    'axes.titlesize':   11,
+    'axes.labelsize':   11,
+    'xtick.labelsize':  11,
+    'ytick.labelsize':  11,
+    'legend.fontsize':  11,
+})
