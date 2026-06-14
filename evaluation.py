@@ -23,6 +23,7 @@ from sklearn.metrics import f1_score, accuracy_score, confusion_matrix, roc_curv
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.decomposition import PCA
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 from sentence_transformers import SentenceTransformer, util
 
 # Local
@@ -173,15 +174,15 @@ def run_baseline_distribution_analysis(df_master, save_folder="Baseline_Distribu
         if pd.api.types.is_numeric_dtype(df_unique[feat]):
             sns.histplot(data=df_unique, x=feat, discrete=True, kde=True, 
              color='#4e79a7', edgecolor='white', linewidth=1.2)
-            plt.title(f'Basisverteilung (Numerisch): {feat} (N={n_videos})', fontsize=12, fontweight='bold')
-            plt.xlabel(feat, fontsize=10)
+            plt.title(f'Basisverteilung (Numerisch): {feat} (N={n_videos})', fontweight='bold')
+            plt.xlabel(feat)
         
         # Categorical features: count plot sorted by frequency
         else:
             order = df_unique[feat].value_counts().index
             ax = sns.countplot(data=df_unique, x=feat, order=order, palette='Set2')
             
-            plt.title(f'Basisverteilung (Kategorisch): {feat} (N={n_videos})', fontsize=12, fontweight='bold')
+            plt.title(f'Basisverteilung (Kategorisch): {feat} (N={n_videos})', fontweight='bold')
             plt.xlabel('')
             plt.xticks(rotation=30, ha='right')
             
@@ -194,7 +195,7 @@ def run_baseline_distribution_analysis(df_master, save_folder="Baseline_Distribu
                             color='black', xytext=(0, 3), textcoords='offset points')
 
         # Shared axis formatting
-        plt.ylabel('Anzahl der Videos', fontsize=10)
+        plt.ylabel('Anzahl der Videos')
         plt.grid(axis='y', linestyle='--', alpha=0.7)
         
         # Expand y-axis to prevent count annotations from being clipped
@@ -403,21 +404,29 @@ def run_aggregation_and_benchmark():
             # Aggregate: mean and std across runs per model
             summary = sub_df.groupby('Base_Model')[metric_cols].agg(['mean', 'std'])
             summary.index = summary.index.map(get_plot_label) # Human-readable display names
-            summary = summary.round(1)
-            
+
+            # Scale ROC AUC from [0,1] to % for consistent display
+            if 'ROC AUC' in summary.columns.get_level_values(0):
+                summary[('ROC AUC', 'mean')] *= 100
+                summary[('ROC AUC', 'std')]  *= 100
+                summary = summary.rename(columns={'ROC AUC': 'ROC AUC (%)'}, level=0)
+            display_metric_cols = ['ROC AUC (%)' if m == 'ROC AUC' else m for m in metric_cols]
+
+            summary = summary.round(2)
+
             summary.to_excel(writer, sheet_name=f'Threshold_{threshold}')
-            
+
             # Auto-generate LaTeX table for this threshold
             # Identify best models for bold formatting  # 'mean')
             idx_max_acc = summary[('Accuracy (%)', 'mean')].idxmax()
             idx_max_f1 = summary[('F1-Score (%)', 'mean')].idxmax()
-            
+
             latex_df = pd.DataFrame(index=summary.index)
-            
-            for metric in metric_cols:
-                if metric in summary.columns.levels[0]:
-                    means = summary[(metric, 'mean')].map('{:.1f}'.format).str.replace('.', '{,}')
-                    stds = summary[(metric, 'std')].map('{:.1f}'.format).str.replace('.', '{,}')
+
+            for metric in display_metric_cols:
+                if metric in summary.columns.get_level_values(0):
+                    means = summary[(metric, 'mean')].map('{:.2f}'.format).str.replace('.', '{,}')
+                    stds = summary[(metric, 'std')].map('{:.2f}'.format).str.replace('.', '{,}')
                     
                     formatted_cells = []
                     for idx in summary.index:
@@ -500,8 +509,8 @@ def run_aggregation_and_benchmark():
     if y_lines:
         ax.hlines(y_lines, *ax.get_xlim(), colors='white', linewidth=3)
 
-    plt.xlabel('Klassifikations-Schwellenwert', fontsize=12)
-    plt.ylabel('', fontsize=12) 
+    plt.xlabel('Klassifikations-Schwellenwert')
+    plt.ylabel('') 
     
     plt.tight_layout()
 
@@ -689,10 +698,10 @@ def run_global_baseline_roc_analysis(df_master):
     if has_data:
         plt.xlim([0.0, 1.0])
         plt.ylim([0.0, 1.05])
-        plt.xlabel('False Positive Rate (FPR)', fontsize=12)
-        plt.ylabel('True Positive Rate (TPR / Recall)', fontsize=12)
-        plt.title('ROC: Basis-Modelle', fontsize=14, fontweight='bold')
-        plt.legend(loc="lower right", fontsize=10)
+        plt.xlabel('False Positive Rate (FPR)')
+        plt.ylabel('True Positive Rate (TPR / Recall)')
+        plt.title('ROC: Basis-Modelle', fontweight='bold')
+        plt.legend(loc="lower right")
         plt.grid(alpha=0.3)
         plt.tight_layout()
         
@@ -768,8 +777,8 @@ def run_family_variant_roc_comparison(df_master):
             plt.ylim([0.0, 1.05])
             plt.xlabel('False Positive Rate (FPR)')
             plt.ylabel('True Positive Rate (TPR)')
-            plt.title(f'ROC: {fam}', fontsize=13, fontweight='bold')
-            plt.legend(loc="lower right", fontsize=9)
+            plt.title(f'ROC: {fam}', fontweight='bold')
+            plt.legend(loc="lower right")
             plt.grid(alpha=0.2)
             plt.tight_layout()
             
@@ -812,19 +821,27 @@ def run_feature_importance_analysis(df_master):
         models_ordered = sorted(df_run['Model'].unique())
         n_models = len(models_ordered)
 
+        # Single row layout — smaller per-panel size keeps 14pt font proportionally large
+        n_cols = n_models
+        n_rows = 1
+
         for feat in META_COLS:
             if feat not in df_run.columns:
                 continue
 
-            is_numeric = pd.api.types.is_numeric_dtype(df_run[feat])
+            # Binary 0/1 columns treated as categorical
+            is_numeric = pd.api.types.is_numeric_dtype(df_run[feat]) and df_run[feat].nunique() > 2
 
             if is_numeric:
                 # ── SWARMPLOT (Strip + Box) ──────────────────────────────────
-                fig, axes = plt.subplots(1, n_models, figsize=(4 * n_models, 5), sharey=True)
-                if n_models == 1:
-                    axes = [axes]
+                fig, axes_grid = plt.subplots(
+                    n_rows, n_cols,
+                    figsize=(2.5 * n_cols, 4.5),
+                    sharey=True, squeeze=False
+                )
+                axes = axes_grid.flatten()
 
-                for ax, model in zip(axes, models_ordered):
+                for idx, (ax, model) in enumerate(zip(axes, models_ordered)):
                     sub = df_run[df_run['Model'] == model].dropna(subset=[feat])
                     palette = {'Korrekt': '#2ca02c', 'Fehler': '#d62728'}
 
@@ -835,33 +852,52 @@ def run_feature_importance_analysis(df_master):
                                   palette=palette, size=4, alpha=0.7, jitter=True,
                                   order=['Korrekt', 'Fehler'])
 
-                    ax.set_title(model, fontsize=10, fontweight='bold')
+                    ax.set_title(model, fontweight='bold')
                     ax.set_xlabel('')
-                    if ax == axes[0]:
-                        ax.set_ylabel(feat, fontsize=10)
-                    else:
-                        ax.set_ylabel('')
+                    ax.set_ylabel(feat if idx % n_cols == 0 else '')
+
+                # Hide unused panels in the last row
+                for ax in axes[n_models:]:
+                    ax.set_visible(False)
 
                 fig.suptitle(f'{run_label} – Verteilung „{feat}" nach Klassifikationsergebnis',
-                             fontsize=12, fontweight='bold')
+                             fontweight='bold')
                 plt.tight_layout()
                 plt.savefig(os.path.join(save_dir, f'Swarm_{feat}.png'), dpi=300, bbox_inches='tight')
                 plt.close()
 
             else:
-                # ── NORMALIZED STACKED BAR CHART ────────────────────────────
-                fig, axes = plt.subplots(1, n_models, figsize=(3.5 * n_models, 5), sharey=True)
-                if n_models == 1:
-                    axes = [axes]
+                # ── VERTICAL STACKED BAR CHART ───────────────────────────────
+                # Derive rotation + bottom margin from longest category label
+                categories = sorted(df_run[feat].dropna().unique().astype(str))
+                max_label_len = max(len(c) for c in categories)
+                n_cats = len(categories)
 
-                for ax, model in zip(axes, models_ordered):
+                if max_label_len <= 5:
+                    tick_rotation, tick_ha, bottom_margin = 0, 'center', 0.20
+                elif max_label_len <= 18:
+                    tick_rotation, tick_ha, bottom_margin = 45, 'right', 0.40
+                else:
+                    tick_rotation, tick_ha, bottom_margin = 90, 'right', 0.52
+
+                # Taller figure when many categories need vertical label space
+                fig_height = 5.5 if n_cats > 6 else 4.5
+
+                fig, axes_grid = plt.subplots(
+                    n_rows, n_cols,
+                    figsize=(2.5 * n_cols, fig_height),
+                    squeeze=False
+                )
+                axes = axes_grid.flatten()
+
+                for idx, (ax, model) in enumerate(zip(axes, models_ordered)):
                     sub = df_run[df_run['Model'] == model].dropna(subset=[feat])
 
                     counts = (sub.groupby([feat, 'Outcome'], observed=False)
                                 .size()
-                                .unstack(fill_value=0))
+                                .unstack(fill_value=0)
+                                .sort_index())
 
-                    # Ensure both outcome columns exist even if one has zero count
                     for col in ['Korrekt', 'Fehler']:
                         if col not in counts.columns:
                             counts[col] = 0
@@ -873,32 +909,40 @@ def run_feature_importance_analysis(df_master):
                         kind='bar', stacked=True, ax=ax,
                         color=['#2ca02c', '#d62728'],
                         edgecolor='white', linewidth=0.5,
-                        legend=(ax == axes[-1])
+                        legend=False
                     )
 
-                    # Annotate with group size
-                    for i, (_, row) in enumerate(counts.iterrows()):
-                        n_total = int(row.sum())
-                        ax.text(i, 101, f'n={n_total}', ha='center', va='bottom',
-                                fontsize=7, color='gray')
+                    # n= annotation above each bar; skip when too many categories
+                    if n_cats <= 6:
+                        for i, (_, row) in enumerate(counts.iterrows()):
+                            n_total = int(row.sum())
+                            ax.text(i, 103, f'n={n_total}', ha='center', va='bottom',
+                                    fontsize=9, color='gray')
 
-                    ax.set_title(model, fontsize=10, fontweight='bold')
+                    ax.set_title(model, fontweight='bold', pad=6)
                     ax.set_xlabel('')
-                    ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right', fontsize=8)
-                    ax.set_ylim(0, 115)
-                    if ax == axes[0]:
-                        ax.set_ylabel('Anteil (%)', fontsize=10)
-                    else:
-                        ax.set_ylabel('')
+                    ax.set_ylabel('Anteil (%)' if idx == 0 else '')
+                    ax.set_ylim(0, 118)
                     ax.axhline(50, color='gray', linewidth=0.8, linestyle='--', alpha=0.6)
+                    plt.setp(ax.get_xticklabels(), rotation=tick_rotation, ha=tick_ha)
 
-                    if ax == axes[-1]:
-                        ax.legend(loc='upper right', fontsize=8, title='Ergebnis')
+                    if idx > 0:
+                        ax.tick_params(left=False)
+                        ax.yaxis.set_ticklabels([])
+                        ax.spines['left'].set_visible(False)
+
+                # Hide unused panels
+                for ax in axes[n_models:]:
+                    ax.set_visible(False)
+
+                plt.subplots_adjust(top=0.82, bottom=bottom_margin,
+                                    left=0.10, right=0.98, wspace=0.05)
 
                 fig.suptitle(f'{run_label} – Klassifikationsergebnis nach „{feat}"',
-                             fontsize=12, fontweight='bold')
-                plt.tight_layout()
-                plt.savefig(os.path.join(save_dir, f'StackedBar_{feat}.png'), dpi=300, bbox_inches='tight')
+                             fontweight='bold')
+
+                plt.savefig(os.path.join(save_dir, f'StackedBar_{feat}.png'),
+                            dpi=300, bbox_inches='tight')
                 plt.close()
 
 
@@ -1039,7 +1083,7 @@ def run_fairness_analysis(df_master):
                     pivot.index = [get_plot_label(model) for model in pivot.index]
                     plt.figure(figsize=(10, len(pivot)*0.5 + 2))
                     sns.heatmap(pivot, annot=True, cmap='RdBu', center=0, fmt='.1f')
-                    plt.title(f'{run_label}: Verzerrung nach {feat}')
+                    plt.title(f'{run_label}: Bias nach {feat}')
                     plt.tight_layout()
                     plt.savefig(os.path.join(run_folder, f'Fairness_Bias_{feat}.png'))
                     plt.close()
@@ -1415,12 +1459,12 @@ def plot_grouped_rates(df_kw, group_col, model_name, run_label, save_folder, lev
         for bar, val in zip(bars, vals):
             if val > 0:
                 ax.text(val + global_max * 0.01, bar.get_y() + bar.get_height() / 2,
-                        f'{val:.2f}', va='center', fontsize=7, color=palette[c])
+                        f'{val:.2f}', va='center', fontsize=9, color=palette[c])
 
     ax.set_yticks(list(y))
     ax.set_yticklabels(labels)
-    ax.set_xlabel('Erwähnungsrate (Nennungen pro Text, normalisiert)', fontsize=10)
-    ax.set_title(f"{plot_label} | {run_label} | {level_name}", fontsize=11)
+    ax.set_xlabel('Erwähnungsrate (Nennungen pro Text, normalisiert)')
+    ax.set_title(f"{plot_label} | {run_label} | {level_name}")
     ax.legend(loc='lower right')
     ax.grid(axis='x', linestyle='--', alpha=0.3)
     plt.tight_layout()
@@ -1457,14 +1501,14 @@ def plot_diverging_bars(df_kw, group_col, model_name, run_label, save_folder, le
     for idx, row in enumerate(df.itertuples()):
         if row.TP > 0:
             ax.text(row.TP + offset, idx, f'{row.TP:.2f}',
-                    va='center', fontsize=8, color='#2ca25f')
+                    va='center', fontsize=10, color='#2ca25f')
         if row.FP > 0:
             ax.text(-row.FP - offset, idx, f'{row.FP:.2f}',
-                    va='center', ha='right', fontsize=8, color='#de2d26')
+                    va='center', ha='right', fontsize=10, color='#de2d26')
 
     ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{abs(x):.2f}'))
-    ax.set_xlabel('← FP  |  TP →', fontsize=10)
-    ax.set_title(f"{plot_label} | {run_label} | {level_name}", fontsize=11)
+    ax.set_xlabel('← FP  |  TP →')
+    ax.set_title(f"{plot_label} | {run_label} | {level_name}")
     ax.legend(loc='lower right')
     ax.grid(axis='x', linestyle='--', alpha=0.4, zorder=1)
     plt.tight_layout()
@@ -1571,10 +1615,10 @@ def plot_model_comparison_heatmap(model_texts, clustered_df, save_folder, metric
         df_heat, annot=True, fmt='.3f', cmap='YlOrRd',
         linewidths=0.4, cbar_kws={'label': f'{metric}-Rate (Nennungen pro Text)'}
     )
-    plt.title(f'Modellvergleich: {metric}-Rate je {level} (aggregiert über alle Runs)', fontsize=12)
+    plt.title(f'Modellvergleich: {metric}-Rate je {level} (aggregiert über alle Runs)')
     plt.xlabel('')
     plt.ylabel('')
-    plt.xticks(rotation=30, ha='right', fontsize=9)
+    plt.xticks(rotation=30, ha='right')
     plt.tight_layout()
 
     fname = os.path.join(save_folder, f'model_comparison_heatmap_{metric}_{level}.png')
@@ -1648,10 +1692,10 @@ def plot_chapter_overview_heatmap(model_texts, clustered_df, save_folder):
         im = ax.imshow(df_plot.values, aspect='auto', cmap=cmap, vmin=0)
 
         ax.set_xticks(range(len(L2_ORDER)))
-        ax.set_xticklabels(L2_ORDER, fontsize=9, rotation=30, ha='right')
+        ax.set_xticklabels(L2_ORDER, fontsize=11, rotation=30, ha='right')
         ax.set_yticks(range(len(df_plot)))
-        ax.set_yticklabels(df_plot.index, fontsize=8)
-        ax.set_title(title, fontsize=9, pad=8)
+        ax.set_yticklabels(df_plot.index, fontsize=10)
+        ax.set_title(title, pad=8)
 
         # White separator lines between model families
         prev_fam = None
@@ -1668,13 +1712,13 @@ def plot_chapter_overview_heatmap(model_texts, clustered_df, save_folder):
                 val = df_plot.values[r, c]
                 text_color = 'white' if val > df_plot.values.max() * 0.6 else 'black'
                 ax.text(c, r, f'{val:.2f}', ha='center', va='center',
-                        fontsize=7, color=text_color)
+                        fontsize=9, color=text_color)
 
         plt.colorbar(im, ax=ax, shrink=0.6,
                      label='Ø Nennungen pro Text')
 
     fig.suptitle('Modellvergleich: Keyword-Erwähnungsraten je L2-Region (aggregiert über alle Runs)',
-                 fontsize=11, fontweight='bold', y=1.01)
+                 fontweight='bold', y=1.01)
     plt.tight_layout()
 
     fname = os.path.join(save_folder, 'chapter_overview_heatmap_L2.png')
@@ -1905,7 +1949,7 @@ def run_best_per_family_ensemble(df_master):
             df_l = df_in[cols_latex].copy()
 
             # Compute mean ± std across runs before formatting individual values
-            mean_std_row = {'Run': r'\textit{Mean $\pm$ SD}', 'LLMs': ''}
+            mean_std_row = {'Run': r'\textit{Mean $\pm$ SD}', 'Models_Used_Display': ''}
             for col in metric_cols:
                 m = pd.to_numeric(df_l[col], errors='coerce').mean()
                 s = pd.to_numeric(df_l[col], errors='coerce').std()
@@ -1931,7 +1975,7 @@ def run_best_per_family_ensemble(df_master):
             print(f" -> LaTeX table saved: {filename}")
 
         cols_latex = ['Run', 'F1-Score (%)', 'Accuracy (%)',
-                      'Precision (%)', 'Recall (%)', 'LLMs']
+                      'Precision (%)', 'Recall (%)', 'Models_Used_Display']
 
         # Best-per-Family
         _to_latex_file(
@@ -2104,7 +2148,7 @@ def run_inter_model_similarity(df_master):
                        s=120, edgecolors='white', linewidths=0.8, zorder=3)
             ax.annotate(label, (coords[i, 0], coords[i, 1]),
                         textcoords='offset points', xytext=(6, 4),
-                        fontsize=7.5, color=color)
+                        fontsize=10, color=color)
 
         # Legend: prompt variants
         legend_variants = [
@@ -2113,12 +2157,12 @@ def run_inter_model_similarity(df_master):
             for v, m in VARIANT_MARKERS.items()
         ]
         ax.legend(handles=legend_variants, title='Prompt-Variante',
-                  loc='lower right', fontsize=8)
+                  loc='lower right')
 
-        ax.set_xlabel(f'PC1 ({var_explained[0]:.1f}% Varianz)', fontsize=10)
-        ax.set_ylabel(f'PC2 ({var_explained[1]:.1f}% Varianz)', fontsize=10)
+        ax.set_xlabel(f'PC1 ({var_explained[0]:.1f}% Varianz)')
+        ax.set_ylabel(f'PC2 ({var_explained[1]:.1f}% Varianz)')
         ax.set_title(f'{run_label}: Semantische Ähnlichkeit der Begründungen (PCA)',
-                     fontsize=12, fontweight='bold')
+                     fontweight='bold')
         ax.grid(alpha=0.3)
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, 'Similarity_PCA_Scatter.png'),
@@ -2154,8 +2198,8 @@ def run_inter_model_similarity(df_master):
                     vmin=0.5, vmax=1.0, linewidths=0.5,
                     cbar_kws={'label': 'Kosinus-Ähnlichkeit'}, ax=ax)
         ax.set_title(f'{run_label}: Semantische Ähnlichkeit zwischen Modellfamilien\n'
-                     f'(Baseline-Modelle)',
-                     fontsize=11, fontweight='bold')
+                     f'(Basis-Modelle)',
+                     fontweight='bold')
         ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right')
         ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
         plt.tight_layout()
