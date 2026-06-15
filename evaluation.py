@@ -2366,6 +2366,89 @@ def run_significance_tests(df_master):
             ph_var_list.append(ph)
 
     # ======================================================
+    # TEST 3: Best Single Model vs Ensembles
+    # ======================================================
+    print("\n--- Test 3: Best Single Model vs Best-per-Family vs Top-3 Ensemble ---")
+
+    # Best single baseline model by majority-vote accuracy
+    bl_keys_mv = [k for k in BASE_MODEL_DISPLAY_NAMES
+                  if '_indicators' not in k and '_thinking' not in k
+                  and k in pivot.columns]
+    best_key  = max(bl_keys_mv, key=lambda k: pivot[k].mean())
+    best_name = get_plot_label(best_key)
+    print(f"  Best single model: {best_name} "
+          f"(acc = {pivot[best_key].mean()*100:.1f}%)")
+
+    y_true_map_ens = (df_master.drop_duplicates('video_id')
+                               .set_index('video_id')['y_true'])
+    all_video_ids = sorted(y_true_map_ens.index)
+    families_ens  = sorted(set(BASE_MODEL_DISPLAY_NAMES.values()))
+
+    def _ensemble_for_run(suffix, top_n=None):
+        col = f'y_pred{suffix}'
+        if col not in df_master.columns:
+            return None
+        run_df = (df_master[['video_id', 'base_model', 'y_true', col]]
+                  .rename(columns={col: 'y_pred'})
+                  .dropna(subset=['y_pred']))
+        champions = []
+        for fam_name in families_ens:
+            fam_df = run_df[run_df['base_model'].apply(
+                lambda x: get_plot_label(x).startswith(fam_name))]
+            if fam_df.empty:
+                continue
+            best_f1, champ = -1, None
+            for tech, data in fam_df.groupby('base_model'):
+                f1 = f1_score(data['y_true'], data['y_pred'],
+                              pos_label=1, zero_division=0)
+                if f1 > best_f1:
+                    best_f1, champ = f1, tech
+            if champ:
+                champions.append((champ, best_f1))
+        if not champions:
+            return None
+        if top_n is not None:
+            use = [m for m, _ in sorted(champions, key=lambda x: x[1],
+                                         reverse=True)[:top_n]]
+        else:
+            use = [m for m, _ in champions]
+        df_use = run_df[run_df['base_model'].isin(use)]
+        return (df_use.groupby('video_id')['y_pred'].mean() > 0.5).astype(int)
+
+    ens_runs, top3_runs = [], []
+    for s in RUN_SUFFIXES:
+        e  = _ensemble_for_run(s, top_n=None)
+        t3 = _ensemble_for_run(s, top_n=3)
+        if e  is not None: ens_runs.append(e)
+        if t3 is not None: top3_runs.append(t3)
+
+    def _mv_across_runs(preds_list):
+        df_s = pd.concat(preds_list, axis=1).reindex(all_video_ids)
+        return (df_s.sum(axis=1) > df_s.shape[1] / 2).astype(int)
+
+    ens_vote  = _mv_across_runs(ens_runs)
+    top3_vote = _mv_across_runs(top3_runs)
+
+    ens_correct  = (ens_vote  == y_true_map_ens.reindex(all_video_ids)).astype(int)
+    top3_correct = (top3_vote == y_true_map_ens.reindex(all_video_ids)).astype(int)
+
+    sys_names = [best_name, 'Best-per-Family', 'Top-3 Ensemble']
+    mat_ens = pd.DataFrame({
+        best_name:         pivot[best_key].reindex(all_video_ids),
+        'Best-per-Family': ens_correct,
+        'Top-3 Ensemble':  top3_correct,
+    }).dropna()
+
+    for name in sys_names:
+        print(f"  {name}: acc = {mat_ens[name].mean()*100:.1f}%  (N={len(mat_ens)})")
+
+    q_ens, sub_ens = _cochrans_q(mat_ens, sys_names)
+    ph_ens = _mcnemar_posthoc(sub_ens, sys_names) if sub_ens is not None else pd.DataFrame()
+    if q_ens:
+        print(f"  Cochran's Q = {q_ens['Q']}, df = {q_ens['df']}, "
+              f"p = {q_ens['p']}, N = {q_ens['N']}  [{q_ens['sig']}]")
+
+    # ======================================================
     # EXPORT: Excel
     # ======================================================
     excel_path = os.path.join(RESULTS_FOLDER, 'significance_tests.xlsx')
@@ -2383,6 +2466,12 @@ def run_significance_tests(df_master):
         if ph_var_list:
             pd.concat(ph_var_list, ignore_index=True).to_excel(
                 writer, sheet_name='McNemar_Variants', index=False)
+        if q_ens:
+            df_q_ens = pd.DataFrame([q_ens])
+            df_q_ens.insert(0, 'Systems', ' | '.join(sys_names))
+            df_q_ens.to_excel(writer, sheet_name='CochransQ_Ensemble', index=False)
+        if not ph_ens.empty:
+            ph_ens.to_excel(writer, sheet_name='McNemar_Ensemble', index=False)
 
     print(f"\n -> Excel saved: {excel_path}")
 
@@ -2407,6 +2496,10 @@ def run_significance_tests(df_master):
     if ph_var_list:
         _to_latex(pd.concat(ph_var_list, ignore_index=True),
                   'sig_mcnemar_variants.tex', 'llcccl')
+    if q_ens:
+        _to_latex(pd.DataFrame([q_ens]), 'sig_cochransq_ensemble.tex', 'ccccc')
+    if not ph_ens.empty:
+        _to_latex(ph_ens, 'sig_mcnemar_ensemble.tex', 'lccccl')
 
     print("=== Significance Tests complete. ===")
 
