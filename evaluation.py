@@ -2171,13 +2171,15 @@ def run_inter_model_similarity(df_master):
         print(f" -> {run_label}: PCA scatter saved.")
 
         # Plot 2: 5x5 family cosine similarity heatmap (baseline models only)
-        baseline_keys = {v: k for k, v in BASE_MODEL_DISPLAY_NAMES.items()
-                         if '_indicators' not in k and '_thinking' not in k}
-
+        # Build fam_embs by scanning all tech keys per display name so that
+        # duplicate entries (e.g. gpt5_2 / gpt5_2_instant → 'GPT 5.2') don't
+        # silently lose a family when the surviving key isn't in mean_embeddings.
         fam_embs = {}
-        for fam, tech_key in baseline_keys.items():
-            if tech_key in mean_embeddings:
-                fam_embs[fam] = mean_embeddings[tech_key]
+        for tech_key, display_name in BASE_MODEL_DISPLAY_NAMES.items():
+            if '_indicators' in tech_key or '_thinking' in tech_key:
+                continue
+            if display_name not in fam_embs and tech_key in mean_embeddings:
+                fam_embs[display_name] = mean_embeddings[tech_key]
 
         fam_names = sorted(fam_embs.keys())
         if len(fam_names) < 2:
