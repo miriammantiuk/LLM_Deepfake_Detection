@@ -51,16 +51,9 @@ Set the following API keys as environment variables before running the inference
 | Variable | Used by |
 |---|---|
 | `QWEN_API_KEY` | Qwen.py |
-| `MOONSHOT_API_KEY` | kimi.py |
-| `OPENROUTER_API_KEY` | seed.py |
-
-Gemini uses a key rotation file. Create `api_keys.json` in the project root:
-
-```json
-{
-  "keys": ["YOUR_GEMINI_KEY_1", "YOUR_GEMINI_KEY_2"]
-}
-```
+| `MOONSHOT_API_KEY` | Kimi.py |
+| `OPENROUTER_API_KEY` | Seed.py |
+| `GEMINI_API_KEY` | Gemini.py |
 
 ---
 
@@ -144,9 +137,3 @@ All outputs (Excel files, plots, LaTeX tables) are saved to `results/` and `plot
 
 ---
 
-## About
-
-This code was developed as part of the Master's thesis  
-*Zero-Shot Deepfake Video Detection using Large Language Models*  
-(M.Sc. Data Science, IU Internationale Hochschule, 2025)
-```
