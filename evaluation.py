@@ -403,7 +403,8 @@ def run_aggregation_and_benchmark():
                 
             # Aggregate: mean and std across runs per model
             summary = sub_df.groupby('Base_Model')[metric_cols].agg(['mean', 'std'])
-            summary.index = summary.index.map(get_plot_label) # Human-readable display names
+            summary.index = summary.index.map(get_plot_label)
+            summary = summary.sort_index(key=lambda x: x.str.lower())
 
             # Scale ROC AUC from [0,1] to % for consistent display
             if 'ROC AUC' in summary.columns.get_level_values(0):
@@ -471,7 +472,7 @@ def run_aggregation_and_benchmark():
     )
 
     # Enforce canonical family x variant ordering
-    familien = sorted(list(set(BASE_MODEL_DISPLAY_NAMES.values())))
+    familien = sorted(set(BASE_MODEL_DISPLAY_NAMES.values()), key=str.lower)
     
     sorted_list = []
     for fam in familien:
@@ -723,7 +724,7 @@ def run_family_variant_roc_comparison(df_master):
     os.makedirs(family_folder, exist_ok=True)
 
     # Extract family names
-    all_families = sorted(list(set(BASE_MODEL_DISPLAY_NAMES.values())))
+    all_families = sorted(set(BASE_MODEL_DISPLAY_NAMES.values()), key=str.lower)
     
     for fam in all_families:
         plt.figure(figsize=(8, 7))
@@ -818,7 +819,7 @@ def run_feature_importance_analysis(df_master):
             print(f"    No baseline data for {run_label}.")
             continue
 
-        models_ordered = sorted(df_run['Model'].unique())
+        models_ordered = sorted(df_run['Model'].unique(), key=str.lower)
         n_models = len(models_ordered)
 
         # Single row layout — smaller per-panel size keeps 14pt font proportionally large
@@ -1003,7 +1004,7 @@ def run_feature_analysis(df_master):
                             y='F1-Score (%)', 
                             hue='Model_Short', 
                             palette=color_dict,
-                            hue_order=sorted(unique_models), 
+                            hue_order=sorted(unique_models, key=str.lower),
                             edgecolor='black'
                         )
 
@@ -1675,7 +1676,7 @@ def plot_chapter_overview_heatmap(model_texts, clustered_df, save_folder):
         df = pd.DataFrame(rate_tables[metric]).reindex(columns=L2_ORDER).fillna(0)
         # Sort models by family for consistent ordering
         family_order = []
-        for fam in sorted(set(BASE_MODEL_DISPLAY_NAMES.values())):
+        for fam in sorted(set(BASE_MODEL_DISPLAY_NAMES.values()), key=str.lower):
             for var in ['', '+I', '+T', '+I+T']:
                 name = f'{fam}{var}'
                 if name in df.index:
@@ -1864,7 +1865,7 @@ def run_best_per_family_ensemble(df_master):
     print("\n=== Best-per-Family Ensemble (Per Run) ===")
 
     # Derive family names from global display name mapping
-    families = sorted(list(set(BASE_MODEL_DISPLAY_NAMES.values())))
+    families = sorted(set(BASE_MODEL_DISPLAY_NAMES.values()), key=str.lower)
     ensemble_results = []
     top3_results = []
 
@@ -2095,52 +2096,30 @@ def run_worst_case_extraction(df_master):
 def run_inter_model_similarity(df_master):
     """Compute cross-model semantic similarity of justifications via SBERT.
 
-    Per run outputs:
+    Per-run and averaged-across-all-runs outputs:
         1. PCA scatter plot of all 20 variants (colour=family, shape=variant)
         2. 5x5 family cosine similarity heatmap (baseline models only)
     """
     print("\n=== Inter-Model Semantic Similarity (SBERT) ===")
 
-    for run_label, df_run in iterate_runs(df_master):
-        save_dir = os.path.join(base_plot_folder, run_label)
-        os.makedirs(save_dir, exist_ok=True)
-
-        if 'justification' not in df_run.columns:
-            print(f" -> {run_label}: No justification column found.")
-            continue
-
-        models = sorted(df_run['base_model'].dropna().unique())
-        print(f" -> {run_label}: Encoding {len(models)} models...")
-
-        # Compute mean embedding per model (one vector per variant)
-        mean_embeddings = {}
-        for m in models:
-            texts = (df_run[df_run['base_model'] == m]['justification']
-                     .dropna().astype(str).tolist())
-            if len(texts) < 3:
-                continue
-            emb = get_sbert().encode(texts, convert_to_tensor=False,
-                                     show_progress_bar=False)
-            mean_embeddings[m] = emb.mean(axis=0)
-
+    def _make_plots(mean_embeddings, save_dir, title_prefix):
+        """Generate PCA scatter + family heatmap from a mean-embedding dict."""
         valid_models = list(mean_embeddings.keys())
         if len(valid_models) < 2:
-            print(f" -> {run_label}: Too few models.")
-            continue
+            return
 
         emb_matrix = np.stack([mean_embeddings[m] for m in valid_models])
-        labels     = [get_plot_label(m) for m in valid_models]
-        colors     = [get_model_color(m) for m in valid_models]
+        labels  = [get_plot_label(m) for m in valid_models]
+        colors  = [get_model_color(m) for m in valid_models]
+        variants = [next((v for v in ['+I+T', '+T', '+I', ''] if l.endswith(v)), '')
+                    for l in labels]
 
-        variants = [next((v for v in ['+I+T', '+T', '+I', ''] if l.endswith(v)), '') for l in labels]
-
-        # Plot 1: PCA scatter of all 20 model variants
+        # Plot 1: PCA scatter
         pca = PCA(n_components=2, random_state=42)
         coords = pca.fit_transform(emb_matrix)
         var_explained = pca.explained_variance_ratio_ * 100
 
         _, ax = plt.subplots(figsize=(10, 8))
-
         for i, (label, color, variant) in enumerate(zip(labels, colors, variants)):
             marker = VARIANT_MARKERS.get(variant, 'o')
             ax.scatter(coords[i, 0], coords[i, 1],
@@ -2150,30 +2129,24 @@ def run_inter_model_similarity(df_master):
                         textcoords='offset points', xytext=(6, 4),
                         fontsize=10, color=color)
 
-        # Legend: prompt variants
         legend_variants = [
             Line2D([0], [0], marker=m, color='gray', linestyle='None',
                    markersize=8, label=f'Baseline{v}' if v == '' else v)
             for v, m in VARIANT_MARKERS.items()
         ]
-        ax.legend(handles=legend_variants, title='Prompt-Variante',
-                  loc='lower right')
-
+        ax.legend(handles=legend_variants, title='Prompt-Variante', loc='lower right')
         ax.set_xlabel(f'PC1 ({var_explained[0]:.1f}% Varianz)')
         ax.set_ylabel(f'PC2 ({var_explained[1]:.1f}% Varianz)')
-        ax.set_title(f'{run_label}: Semantische Ähnlichkeit der Begründungen (PCA)',
+        ax.set_title(f'{title_prefix}: Semantische Ähnlichkeit der Begründungen (PCA)',
                      fontweight='bold')
         ax.grid(alpha=0.3)
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, 'Similarity_PCA_Scatter.png'),
                     dpi=300, bbox_inches='tight')
         plt.close()
-        print(f" -> {run_label}: PCA scatter saved.")
+        print(f" -> {title_prefix}: PCA scatter saved.")
 
-        # Plot 2: 5x5 family cosine similarity heatmap (baseline models only)
-        # Build fam_embs by scanning all tech keys per display name so that
-        # duplicate entries (e.g. gpt5_2 / gpt5_2_instant → 'GPT 5.2') don't
-        # silently lose a family when the surviving key isn't in mean_embeddings.
+        # Plot 2: family cosine similarity heatmap
         fam_embs = {}
         for tech_key, display_name in BASE_MODEL_DISPLAY_NAMES.items():
             if '_indicators' in tech_key or '_thinking' in tech_key:
@@ -2181,9 +2154,9 @@ def run_inter_model_similarity(df_master):
             if display_name not in fam_embs and tech_key in mean_embeddings:
                 fam_embs[display_name] = mean_embeddings[tech_key]
 
-        fam_names = sorted(fam_embs.keys())
+        fam_names = sorted(fam_embs.keys(), key=str.lower)
         if len(fam_names) < 2:
-            continue
+            return
 
         n_fam = len(fam_names)
         sim_fam = np.zeros((n_fam, n_fam))
@@ -2194,21 +2167,101 @@ def run_inter_model_similarity(df_master):
                 sim_fam[i, j] = float(np.dot(e1, e2))
 
         df_fam = pd.DataFrame(sim_fam, index=fam_names, columns=fam_names)
-
         _, ax = plt.subplots(figsize=(7, 5))
         sns.heatmap(df_fam, annot=True, fmt='.2f', cmap='YlOrRd',
                     vmin=0.5, vmax=1.0, linewidths=0.5,
                     cbar_kws={'label': 'Kosinus-Ähnlichkeit'}, ax=ax)
-        ax.set_title(f'{run_label}: Semantische Ähnlichkeit zwischen Modellfamilien\n'
-                     f'(Basis-Modelle)',
-                     fontweight='bold')
+        ax.set_title(f'{title_prefix}: Semantische Ähnlichkeit zwischen Modellfamilien\n'
+                     f'(Basis-Modelle)', fontweight='bold')
         ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right')
         ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, 'Similarity_Family_Heatmap.png'),
                     dpi=300, bbox_inches='tight')
         plt.close()
-        print(f" -> {run_label}: Family heatmap saved.")
+        print(f" -> {title_prefix}: Family heatmap saved.")
+
+    family_sim_matrices = []
+    family_names_ref    = None
+
+    for run_label, df_run in iterate_runs(df_master):
+        save_dir = os.path.join(base_plot_folder, run_label)
+        os.makedirs(save_dir, exist_ok=True)
+
+        if 'justification' not in df_run.columns:
+            print(f" -> {run_label}: No justification column found.")
+            continue
+
+        models = sorted(df_run['base_model'].dropna().unique(),
+                        key=lambda x: get_plot_label(x).lower())
+        print(f" -> {run_label}: Encoding {len(models)} models...")
+
+        mean_embeddings = {}
+        for m in models:
+            texts = (df_run[df_run['base_model'] == m]['justification']
+                     .dropna().astype(str).tolist())
+            if len(texts) < 3:
+                continue
+            emb = get_sbert().encode(texts, convert_to_tensor=False,
+                                     show_progress_bar=False)
+            mean_embeddings[m] = emb.mean(axis=0)
+
+        if len(mean_embeddings) < 2:
+            print(f" -> {run_label}: Too few models.")
+            continue
+
+        _make_plots(mean_embeddings, save_dir, run_label)
+
+        # Collect per-run family similarity matrix for cross-run averaging
+        fam_embs_run = {}
+        for tech_key, display_name in BASE_MODEL_DISPLAY_NAMES.items():
+            if '_indicators' in tech_key or '_thinking' in tech_key:
+                continue
+            if display_name not in fam_embs_run and tech_key in mean_embeddings:
+                fam_embs_run[display_name] = mean_embeddings[tech_key]
+
+        fam_names_run = sorted(fam_embs_run.keys(), key=str.lower)
+        if len(fam_names_run) >= 2:
+            n = len(fam_names_run)
+            mat = np.zeros((n, n))
+            for i, fa in enumerate(fam_names_run):
+                for j, fb in enumerate(fam_names_run):
+                    e1 = fam_embs_run[fa] / np.linalg.norm(fam_embs_run[fa])
+                    e2 = fam_embs_run[fb] / np.linalg.norm(fam_embs_run[fb])
+                    mat[i, j] = float(np.dot(e1, e2))
+            family_sim_matrices.append(mat)
+            if family_names_ref is None:
+                family_names_ref = fam_names_run
+
+    # --- μ ± σ heatmap: average the three per-run similarity matrices ---
+    if len(family_sim_matrices) >= 2 and family_names_ref is not None:
+        stacked  = np.stack(family_sim_matrices)
+        mean_mat = stacked.mean(axis=0)
+        std_mat  = stacked.std(axis=0, ddof=1)
+
+        annot = np.array([[f"{mean_mat[i,j]:.2f}\n±{std_mat[i,j]:.2f}"
+                           for j in range(len(family_names_ref))]
+                          for i in range(len(family_names_ref))])
+
+        save_dir_avg = os.path.join(base_plot_folder, 'Aggregated')
+        os.makedirs(save_dir_avg, exist_ok=True)
+
+        df_mean = pd.DataFrame(mean_mat,
+                               index=family_names_ref, columns=family_names_ref)
+        _, ax = plt.subplots(figsize=(7, 5))
+        sns.heatmap(df_mean, annot=annot, fmt='', cmap='YlOrRd',
+                    vmin=0.5, vmax=1.0, linewidths=0.5,
+                    cbar_kws={'label': 'Kosinus-Ähnlichkeit'}, ax=ax)
+        ax.set_title('Semantische Ähnlichkeit zwischen Modellfamilien\n'
+                     '(Basis-Modelle, μ ± σ über alle Runs)',
+                     fontweight='bold')
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right')
+        ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir_avg, 'Similarity_Family_Heatmap_Mean.png'),
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+        print(" -> Alle Runs: μ±σ family heatmap saved.")
 
 
 def run_significance_tests(df_master):
@@ -2318,7 +2371,7 @@ def run_significance_tests(df_master):
     bl_keys = sorted(
         [k for k in BASE_MODEL_DISPLAY_NAMES
          if '_indicators' not in k and '_thinking' not in k and k in pivot.columns],
-        key=lambda x: get_plot_label(x)
+        key=lambda x: get_plot_label(x).lower()
     )
     bl_names = [get_plot_label(k) for k in bl_keys]
 
@@ -2337,7 +2390,7 @@ def run_significance_tests(df_master):
     # ======================================================
     print("\n--- Test 2: Prompt Variants per Family ---")
 
-    families = sorted(set(BASE_MODEL_DISPLAY_NAMES.values()))
+    families = sorted(set(BASE_MODEL_DISPLAY_NAMES.values()), key=str.lower)
     q_var_rows, ph_var_list = [], []
 
     for fam in families:
@@ -2370,19 +2423,29 @@ def run_significance_tests(df_master):
     # ======================================================
     print("\n--- Test 3: Best Single Model vs Best-per-Family vs Top-3 Ensemble ---")
 
-    # Best single baseline model by majority-vote accuracy
-    bl_keys_mv = [k for k in BASE_MODEL_DISPLAY_NAMES
-                  if '_indicators' not in k and '_thinking' not in k
-                  and k in pivot.columns]
-    best_key  = max(bl_keys_mv, key=lambda k: pivot[k].mean())
+    # Best single model: mean F1 across runs (identical to benchmark_scientific_report)
+    def _mean_f1(key):
+        rows = df_master[df_master['base_model'] == key].drop_duplicates('video_id')
+        if rows.empty:
+            return 0.0
+        f1s = []
+        for col in available:
+            sub = rows[['y_true', col]].dropna()
+            if sub.empty:
+                continue
+            f1s.append(f1_score(sub['y_true'], sub[col], pos_label=1, zero_division=0))
+        return float(np.mean(f1s)) if f1s else 0.0
+
+    best_key  = max(pivot.columns, key=_mean_f1)
     best_name = get_plot_label(best_key)
+    best_f1   = _mean_f1(best_key)
     print(f"  Best single model: {best_name} "
-          f"(acc = {pivot[best_key].mean()*100:.1f}%)")
+          f"(mean F1 = {best_f1*100:.1f}%)")
 
     y_true_map_ens = (df_master.drop_duplicates('video_id')
                                .set_index('video_id')['y_true'])
     all_video_ids = sorted(y_true_map_ens.index)
-    families_ens  = sorted(set(BASE_MODEL_DISPLAY_NAMES.values()))
+    families_ens  = sorted(set(BASE_MODEL_DISPLAY_NAMES.values()), key=str.lower)
 
     def _ensemble_for_run(suffix, top_n=None):
         col = f'y_pred{suffix}'
@@ -2390,7 +2453,7 @@ def run_significance_tests(df_master):
             return None
         run_df = (df_master[['video_id', 'base_model', 'y_true', col]]
                   .rename(columns={col: 'y_pred'})
-                  .dropna(subset=['y_pred']))
+                  .dropna(subset=['y_pred', 'y_true']))
         champions = []
         for fam_name in families_ens:
             fam_df = run_df[run_df['base_model'].apply(
