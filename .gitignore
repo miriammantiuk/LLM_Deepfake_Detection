@@ -3,7 +3,7 @@
 *.json
 *.png
 *.tex
-§.jpg
+*.jpg
 data/
 plots/
 archiv/
@@ -14,7 +14,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
+*.Python
 *.egg-info/
 dist/
 build/
