@@ -407,12 +407,12 @@ def run_aggregation_and_benchmark():
             summary = summary.sort_index(key=lambda x: x.str.lower())
 
             # Scale ROC AUC from [0,1] to % for consistent display
-            if 'ROC AUC' in summary.columns.get_level_values(0):
-                summary[('ROC AUC', 'mean')] *= 100
-                summary[('ROC AUC', 'std')]  *= 100
-                summary = summary.rename(columns={'ROC AUC': 'ROC AUC (%)'}, level=0)
-            display_metric_cols = ['ROC AUC (%)' if m == 'ROC AUC' else m for m in metric_cols]
-
+            #if 'ROC AUC' in summary.columns.get_level_values(0):
+            #    summary[('ROC AUC', 'mean')] *= 100
+            #    summary[('ROC AUC', 'std')]  *= 100
+            #    summary = summary.rename(columns={'ROC AUC': 'ROC AUC (%)'}, level=0)
+            #display_metric_cols = ['ROC AUC (%)' if m == 'ROC AUC' else m for m in metric_cols]
+            display_metric_cols = metric_cols
             summary = summary.round(2)
 
             summary.to_excel(writer, sheet_name=f'Threshold_{threshold}')
@@ -675,25 +675,34 @@ def run_global_baseline_roc_analysis(df_master):
             
         all_y_true = []
         all_y_prob = []
-        
-        # Probabilies and Labels from all runs
+        per_run_aucs = []
+
+        # Probabilities and labels from all runs
         for suffix in RUN_SUFFIXES:
             prob_col = f'probability_fake{suffix}'
             if prob_col in model_group.columns:
                 probs = pd.to_numeric(model_group[prob_col], errors='coerce').fillna(0)
-                if probs.max() > 1.0: probs = probs / 100.0
-                
+                if probs.max() > 1.0:
+                    probs = probs / 100.0
+                y_true_run = model_group['y_true'].tolist()
                 all_y_prob.extend(probs.tolist())
-                all_y_true.extend(model_group['y_true'].tolist())
-        
+                all_y_true.extend(y_true_run)
+                # Per-run AUC for mean annotation (consistent with benchmark table)
+                try:
+                    r_fpr, r_tpr, _ = roc_curve(y_true_run, probs.tolist())
+                    per_run_aucs.append(auc(r_fpr, r_tpr))
+                except Exception:
+                    pass
+
         if all_y_prob:
             has_data = True
             fpr, tpr, _ = roc_curve(all_y_true, all_y_prob)
-            roc_auc_val = auc(fpr, tpr)
-            
+            # Use mean of per-run AUCs to match benchmark table
+            roc_auc_val = float(np.mean(per_run_aucs)) if per_run_aucs else auc(fpr, tpr)
+
             color = get_model_color(tech_base_name)
-            
-            plt.plot(fpr, tpr, color=color, lw=3, 
+
+            plt.plot(fpr, tpr, color=color, lw=3,
                      label=f'{display_name} (AUC = {roc_auc_val:.2f})')
 
     if has_data:
@@ -946,6 +955,128 @@ def run_feature_importance_analysis(df_master):
                             dpi=300, bbox_inches='tight')
                 plt.close()
 
+    # ── AVERAGED ACROSS RUNS ────────────────────────────────────────────────
+    print(" -> Alle_Runs (gemittelte Feature-Importance)...")
+    pred_cols = [f'y_pred{s}' for s in RUN_SUFFIXES]
+    avail_pred = [c for c in pred_cols if c in df_master.columns]
+    if len(avail_pred) >= 2:
+        df_base_all = df_master[df_master['base_model'].isin(baseline_keys)].copy()
+        df_base_all['Model'] = df_base_all['base_model'].apply(get_plot_label)
+        models_avg = sorted(df_base_all['Model'].unique(), key=str.lower)
+        n_cols_avg = len(models_avg)
+        save_dir_avg = os.path.join(base_plot_folder, 'Alle_Runs', 'Feature_Importance')
+        os.makedirs(save_dir_avg, exist_ok=True)
+
+        for feat in META_COLS:
+            if feat not in df_base_all.columns:
+                continue
+            is_numeric = (pd.api.types.is_numeric_dtype(df_base_all[feat])
+                          and df_base_all[feat].nunique() > 2)
+            if is_numeric:
+                # Pool all runs into one combined box/swarm plot
+                frames = []
+                for col in avail_pred:
+                    tmp = df_base_all[['Model', feat, 'y_true', col]].dropna().copy()
+                    tmp['Outcome'] = (tmp[col] == tmp['y_true']).map(
+                        {True: 'Korrekt', False: 'Fehler'})
+                    frames.append(tmp[['Model', feat, 'Outcome']])
+                df_long = pd.concat(frames, ignore_index=True)
+                palette = {'Korrekt': '#2ca02c', 'Fehler': '#d62728'}
+                fig, axes_grid = plt.subplots(1, n_cols_avg,
+                                              figsize=(2.5 * n_cols_avg, 4.5),
+                                              sharey=True, squeeze=False)
+                for idx, (ax, model) in enumerate(zip(axes_grid.flatten(), models_avg)):
+                    sub = df_long[df_long['Model'] == model].dropna(subset=[feat])
+                    sns.boxplot(data=sub, x='Outcome', y=feat, ax=ax, palette=palette,
+                                width=0.4, order=['Korrekt', 'Fehler'],
+                                showfliers=False, linewidth=1.2)
+                    sns.stripplot(data=sub, x='Outcome', y=feat, ax=ax, palette=palette,
+                                  size=4, alpha=0.7, jitter=True,
+                                  order=['Korrekt', 'Fehler'])
+                    ax.set_title(model, fontweight='bold')
+                    ax.set_xlabel('')
+                    ax.set_ylabel(feat if idx == 0 else '')
+                for ax in axes_grid.flatten()[n_cols_avg:]:
+                    ax.set_visible(False)
+                fig.suptitle(
+                    f'Alle Runs – Verteilung „{feat}" nach Klassifikationsergebnis',
+                    fontweight='bold')
+                plt.tight_layout()
+                plt.savefig(os.path.join(save_dir_avg, f'Swarm_{feat}.png'),
+                            dpi=300, bbox_inches='tight')
+                plt.close()
+            else:
+                # Mean proportion correct per (model, group) across runs → stacked bar
+                categories = sorted(df_base_all[feat].dropna().unique().astype(str))
+                max_label_len = max(len(c) for c in categories)
+                n_cats = len(categories)
+                if max_label_len <= 5:
+                    tick_rotation, tick_ha, bottom_margin = 0, 'center', 0.20
+                elif max_label_len <= 18:
+                    tick_rotation, tick_ha, bottom_margin = 45, 'right', 0.40
+                else:
+                    tick_rotation, tick_ha, bottom_margin = 90, 'right', 0.52
+                fig_height = 5.5 if n_cats > 6 else 4.5
+                fig, axes_grid = plt.subplots(1, n_cols_avg,
+                                              figsize=(2.5 * n_cols_avg, fig_height),
+                                              squeeze=False)
+                axes = axes_grid.flatten()
+                for idx, (ax, model) in enumerate(zip(axes, models_avg)):
+                    sub = df_base_all[df_base_all['Model'] == model].dropna(subset=[feat])
+                    prop_rows = []
+                    for group_val in categories:
+                        grp = sub[sub[feat].astype(str) == group_val]
+                        if grp.empty:
+                            prop_rows.append({'Group': group_val, 'Korrekt': 0.0,
+                                              'Fehler': 100.0, 'N': 0, 'Std': 0.0})
+                            continue
+                        pcts = []
+                        for col in avail_pred:
+                            col_grp = grp.dropna(subset=[col])
+                            if not col_grp.empty:
+                                pcts.append(
+                                    (col_grp[col] == col_grp['y_true']).mean() * 100)
+                        mean_c = float(np.mean(pcts)) if pcts else 0.0
+                        std_c  = float(np.std(pcts, ddof=1)) if len(pcts) >= 2 else 0.0
+                        prop_rows.append({'Group': group_val, 'Korrekt': mean_c,
+                                          'Fehler': 100.0 - mean_c,
+                                          'N': len(grp), 'Std': std_c})
+                    df_prop = pd.DataFrame(prop_rows).set_index('Group')
+                    df_prop[['Korrekt', 'Fehler']].plot(
+                        kind='bar', stacked=True, ax=ax,
+                        color=['#2ca02c', '#d62728'],
+                        edgecolor='white', linewidth=0.5, legend=False)
+                    # Error bars at the green/red boundary (= mean proportion correct)
+                    for i, row in enumerate(df_prop.itertuples()):
+                        if row.Std > 0:
+                            ax.errorbar(i, row.Korrekt, yerr=row.Std,
+                                        fmt='none', color='black', capsize=4,
+                                        linewidth=1.5, zorder=5)
+                    if n_cats <= 6:
+                        for i, row in enumerate(df_prop.itertuples()):
+                            ax.text(i, 103, f'n={int(row.N)}',
+                                    ha='center', va='bottom', fontsize=9, color='gray')
+                    ax.set_title(model, fontweight='bold', pad=6)
+                    ax.set_xlabel('')
+                    ax.set_ylabel('Anteil (%)' if idx == 0 else '')
+                    ax.set_ylim(0, 118)
+                    ax.axhline(50, color='gray', linewidth=0.8, linestyle='--', alpha=0.6)
+                    plt.setp(ax.get_xticklabels(), rotation=tick_rotation, ha=tick_ha)
+                    if idx > 0:
+                        ax.tick_params(left=False)
+                        ax.yaxis.set_ticklabels([])
+                        ax.spines['left'].set_visible(False)
+                for ax in axes[n_cols_avg:]:
+                    ax.set_visible(False)
+                plt.subplots_adjust(top=0.82, bottom=bottom_margin,
+                                    left=0.10, right=0.98, wspace=0.05)
+                fig.suptitle(
+                    f'Alle Runs – Klassifikationsergebnis nach „{feat}" (Mittelwert)',
+                    fontweight='bold')
+                plt.savefig(os.path.join(save_dir_avg, f'StackedBar_{feat}.png'),
+                            dpi=300, bbox_inches='tight')
+                plt.close()
+
 
 def run_feature_analysis(df_master):
     """Compute and plot per-model F1 scores broken down by each metadata feature.
@@ -955,10 +1086,13 @@ def run_feature_analysis(df_master):
     charts (≤3 groups) or heatmaps (>3 groups) per run and feature.
     """
     print("\n=== Feature Analysis (Per Run) ===")
+    baseline_keys = [k for k in BASE_MODEL_DISPLAY_NAMES
+                     if '_indicators' not in k and '_thinking' not in k]
     all_results = []
 
     for run_label, df_run in iterate_runs(df_master):
-        for model_name, model_df in df_run.groupby('base_model'):
+        for model_name, model_df in df_run[
+                df_run['base_model'].isin(baseline_keys)].groupby('base_model'):
             for feat in META_COLS:
                 if feat not in model_df.columns: continue
                 
@@ -1029,6 +1163,66 @@ def run_feature_analysis(df_master):
                 except Exception as e:
                     print(f" [WARN] Feature plot for '{feat}' failed: {e}")
 
+        # ── AVERAGED ACROSS RUNS ──────────────────────────────────────────
+        print(" -> Alle_Runs: gemittelte Feature-Analyse...")
+        save_dir_avg = os.path.join(base_plot_folder, 'Alle_Runs')
+        os.makedirs(save_dir_avg, exist_ok=True)
+
+        df_avg = (df_res.groupby(['Model', 'Feature', 'Group'])['F1-Score (%)']
+                  .agg(['mean', 'std'])
+                  .reset_index()
+                  .rename(columns={'mean': 'Mean', 'std': 'Std'}))
+        df_avg['Display_Name'] = df_avg['Model'].apply(get_plot_label)
+        df_avg['Std'] = df_avg['Std'].fillna(0)
+
+        for feat in df_avg['Feature'].unique():
+            subset = df_avg[df_avg['Feature'] == feat]
+            try:
+                pivot_mean = subset.pivot(index='Display_Name', columns='Group', values='Mean')
+                pivot_std  = subset.pivot(index='Display_Name', columns='Group', values='Std')
+                pivot_mean = pivot_mean.sort_index(key=lambda x: x.str.lower())
+                pivot_std  = pivot_std.reindex(pivot_mean.index).fillna(0)
+                n_groups   = len(pivot_mean.columns)
+
+                if n_groups <= 3:
+                    groups   = list(pivot_mean.columns)
+                    models_p = list(pivot_mean.index)
+                    x        = np.arange(len(groups))
+                    width    = 0.8 / len(models_p) if models_p else 0.8
+                    fig, ax  = plt.subplots(figsize=(12, 6))
+                    for i, model in enumerate(models_p):
+                        means = [pivot_mean.loc[model, g] if g in pivot_mean.columns else 0
+                                 for g in groups]
+                        stds  = [pivot_std.loc[model, g] if g in pivot_std.columns else 0
+                                 for g in groups]
+                        ax.bar(x + i * width, means, width,
+                               label=model, color=get_model_color(model),
+                               edgecolor='black',
+                               yerr=stds, capsize=3, error_kw={'elinewidth': 1})
+                    ax.set_xticks(x + width * (len(models_p) - 1) / 2)
+                    ax.set_xticklabels(groups)
+                    ax.set_ylabel('F1-Score (%)')
+                    ax.set_ylim(0, 105)
+                    ax.set_title(f'Alle Runs: {feat} – F1-Score nach Gruppe (μ ± σ)')
+                    ax.legend(title='Modell', bbox_to_anchor=(1.05, 1), loc='upper left')
+                    ax.grid(axis='y', linestyle='--', alpha=0.7)
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(save_dir_avg,
+                                             f'Feature_Analysis_{feat}_Bar_Mean.png'))
+                    plt.close()
+                else:
+                    annot = (pivot_mean.round(1).astype(str) + '\n±'
+                             + pivot_std.round(1).astype(str))
+                    plt.figure(figsize=(10, len(pivot_mean) * 0.5 + 2))
+                    sns.heatmap(pivot_mean, annot=annot, cmap='RdYlGn', fmt='', vmin=0, vmax=100)
+                    plt.title(f'Alle Runs: {feat} – F1-Score nach Gruppe (μ ± σ)')
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(save_dir_avg,
+                                             f'Feature_Analysis_{feat}_Heatmap_Mean.png'))
+                    plt.close()
+            except Exception as e:
+                print(f" [WARN] Averaged feature plot for '{feat}' failed: {e}")
+
 def run_fairness_analysis(df_master):
     """Test whether model performance differs significantly across demographic groups.
 
@@ -1061,11 +1255,21 @@ def run_fairness_analysis(df_master):
                         _, p = fisher_exact(tbl); test = "Fisher"
                     else:
                         _, p, _, _ = chi2_contingency(tbl); test = "Chi2"
-                    
+
+                    # Cramér's V (= phi for 2×2): effect size independent of n
+                    a, b = tbl[0]; c, d = tbl[1]
+                    n_tbl = a + b + c + d
+                    denom = (a+b) * (c+d) * (a+c) * (b+d)
+                    cramer_v = abs(a*d - b*c) / np.sqrt(denom) if denom > 0 else 0.0
+
                     all_results.append({
-                        'Run': run_label, 'Model': model_name, 'Display_Name': BASE_MODEL_DISPLAY_NAMES.get(model_name, model_name), 'Feature': feat, 'Group': str(name),
-                        'Accuracy (%)': round(acc_group*100,1), 'Diff to Global': round((acc_group-global_acc)*100,2),
-                        'P-Value': round(p,4), 'Test': test
+                        'Run': run_label, 'Model': model_name,
+                        'Display_Name': BASE_MODEL_DISPLAY_NAMES.get(model_name, model_name),
+                        'Feature': feat, 'Group': str(name),
+                        'Accuracy (%)': round(acc_group*100, 1),
+                        'Diff to Global': round((acc_group-global_acc)*100, 2),
+                        'P-Value': round(p, 4), 'Test': test,
+                        "Cramér's V": round(cramer_v, 3),
                     })
 
     if all_results:
@@ -1091,8 +1295,155 @@ def run_fairness_analysis(df_master):
                 except Exception as e:
                     print(f" [WARN] Fairness plot for '{feat}' failed: {e}")
 
+        # ── AVERAGED ACROSS RUNS ──────────────────────────────────────────
+        print(" -> Alle_Runs: gemittelte Bias-Heatmaps...")
+        save_dir_avg = os.path.join(base_plot_folder, 'Alle_Runs')
+        os.makedirs(save_dir_avg, exist_ok=True)
 
+        df_avg_fair = (df_res.groupby(['Model', 'Feature', 'Group'])['Diff to Global']
+                       .agg(['mean', 'std'])
+                       .reset_index()
+                       .rename(columns={'mean': 'Mean', 'std': 'Std'}))
+        df_avg_fair['Display_Name'] = df_avg_fair['Model'].apply(get_plot_label)
+        df_avg_fair['Std'] = df_avg_fair['Std'].fillna(0)
 
+        for feat in df_avg_fair['Feature'].unique():
+            try:
+                subset     = df_avg_fair[df_avg_fair['Feature'] == feat]
+                pivot_mean = subset.pivot(index='Display_Name', columns='Group', values='Mean')
+                pivot_std  = subset.pivot(index='Display_Name', columns='Group', values='Std')
+                pivot_mean = pivot_mean.sort_index(key=lambda x: x.str.lower())
+                pivot_std  = pivot_std.reindex(pivot_mean.index).fillna(0)
+                annot = (pivot_mean.round(1).astype(str) + '\n±'
+                         + pivot_std.round(1).astype(str))
+                plt.figure(figsize=(10, len(pivot_mean) * 0.5 + 2))
+                sns.heatmap(pivot_mean, annot=annot, cmap='RdBu', center=0, fmt='')
+                plt.title(f'Alle Runs: Verzerrung nach {feat} (μ ± σ)')
+                plt.tight_layout()
+                plt.savefig(os.path.join(save_dir_avg, f'Fairness_Bias_{feat}_Mean.png'))
+                plt.close()
+            except Exception as e:
+                print(f" [WARN] Averaged fairness plot for '{feat}' failed: {e}")
+
+        # ── SUMMARY TABLE: significant subgroups ──────────────────────────
+        print(" -> Summary: signifikante Subgruppen je Modell...")
+        n_runs = df_res['Run'].nunique()
+
+        summary = (df_res.groupby(['Model', 'Feature', 'Group'])
+                   .agg(
+                       Sig_Runs     = ('P-Value',        lambda x: (x < 0.05).sum()),
+                       P_Min        = ('P-Value',        'min'),
+                       P_Max        = ('P-Value',        'max'),
+                       CramerV_Mean = ("Cramér's V",     'mean'),
+                       Diff_Mean    = ('Diff to Global', 'mean'),
+                   )
+                   .reset_index())
+        summary['Display_Name'] = summary['Model'].apply(get_plot_label)
+
+        def _effect_label(v):
+            if v >= 0.5: return 'groß'
+            if v >= 0.3: return 'mittel'
+            if v >= 0.1: return 'klein'
+            return 'vernachlässigbar'
+        summary['Effekt'] = summary['CramerV_Mean'].apply(_effect_label)
+
+        # Remove deepfake_type (redundant with deepfake_category)
+        summary = summary[summary['Feature'] != 'deepfake_type'].copy()
+
+        # Collapse binary features: both groups carry identical p/V → keep one row
+        # labelled "A vs. B", retaining the group with larger |Diff_Mean|
+        collapsed = []
+        for (model, feat), grp in summary.groupby(['Model', 'Feature'], sort=False):
+            if len(grp) == 2:
+                row = grp.loc[grp['Diff_Mean'].abs().idxmax()].copy()
+                labels = sorted(grp['Group'].tolist(), key=str.lower)
+                row['Group'] = f"{labels[0]} vs. {labels[1]}"
+                # Binary test is symmetric → Sig_Runs identical in both rows
+                row['Sig_Runs'] = grp['Sig_Runs'].max()
+                collapsed.append(row)
+            else:
+                for _, r in grp.iterrows():
+                    collapsed.append(r)
+        summary = pd.DataFrame(collapsed).reset_index(drop=True)
+
+        # Threshold: significant in ≥ 2/3 runs (survives stricter scrutiny)
+        summary_sig = (summary[summary['Sig_Runs'] >= 2]
+                       .sort_values(['Sig_Runs', 'P_Min'], ascending=[False, True])
+                       .reset_index(drop=True))
+
+        summary_sig['Sign. Runs'] = (summary_sig['Sig_Runs'].astype(str)
+                                     + f'/{n_runs}')
+        summary_sig['p-Bereich']  = (summary_sig['P_Min'].map('{:.3f}'.format)
+                                     + '–'
+                                     + summary_sig['P_Max'].map('{:.3f}'.format))
+
+        export_cols = {
+            'Display_Name': 'Modell',
+            'Feature':      'Feature',
+            'Group':        'Gruppe',
+            'Sign. Runs':   'Sign. Runs',
+            'p-Bereich':    'p-Bereich',
+            'CramerV_Mean': "Ø Cramér's V",
+            'Effekt':       'Effektgröße',
+            'Diff_Mean':    'Ø Δ Accuracy (%)',
+        }
+        df_export = (summary_sig[list(export_cols.keys())]
+                     .rename(columns=export_cols)
+                     .round({"Ø Cramér's V": 3, 'Ø Δ Accuracy (%)': 1}))
+        df_export.to_excel(
+            os.path.join(RESULTS_FOLDER, 'fairness_summary.xlsx'), index=False)
+
+        # LaTeX export — 8 columns
+        caption = (
+            r'\caption{Signifikante Subgruppen der Fairness-Analyse '
+            r'(p\,<\,0{,}05 in mind.\,2\,von\,' + str(n_runs) + r'\,Runs; '
+            r'\textit{deepfake\_type} ausgenommen)}'
+        )
+        tex_lines = [
+            r'\begin{table}[htbp]',
+            r'\centering',
+            r'\small',
+            caption,
+            r'\label{tab:fairness_summary}',
+            r'\resizebox{\textwidth}{!}{%', 
+            r'\begin{tabular}{lllccrrl}',
+            r'\toprule',
+            r'Modell & Feature & Gruppe & Sign.\,Runs & '
+            r'$p$-Bereich & $\overline{V}$ & Effekt & '
+            r'$\overline{\Delta}$\,Acc.\,(\%) \\',
+            r'\midrule',
+        ]
+
+        for _, row in df_export.iterrows():
+            cramer_col = "Ø Cramér's V"
+            cramer_str = f"{float(row[cramer_col]):.3f}".replace('.', '{,}')
+            diff_str   = f"{float(row['Ø Δ Accuracy (%)']):.1f}".replace('.', '{,}')
+            p_range    = str(row['p-Bereich']).replace('.', '{,}')
+            
+            
+            modell_str  = str(row['Modell']).replace('_', r'\_')
+            feature_str = str(row['Feature']).replace('_', r'\_')
+            gruppe_str  = str(row['Gruppe']).replace('_', r'\_')
+            
+            tex_lines.append(
+                f"{modell_str} & {feature_str} & {gruppe_str} & "
+                f"{row['Sign. Runs']} & {p_range} & "
+                f"{cramer_str} & {row['Effektgröße']} & {diff_str} \\\\"
+            )
+
+        tex_lines += [
+            r'\bottomrule', 
+            r'\end{tabular}%',
+            r'}',
+            r'\end{table}'
+        ]
+
+        tex_path = os.path.join(RESULTS_FOLDER, 'fairness_summary.tex')
+        with open(tex_path, 'w', encoding='utf-8') as fh:
+            fh.write('\n'.join(tex_lines))
+
+        print(f"    -> {len(summary_sig)} signifikante Subgruppen "
+              f"exportiert (fairness_summary.xlsx / .tex)")
 
 
 def run_intra_model_consistency_check(df_master):
