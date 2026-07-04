@@ -43,7 +43,7 @@ def calculate_metrics(y_true, y_pred, y_prob=None):
         'Precision (%)': round(precision * 100, 1),
         'Recall (%)':    round(recall * 100, 1),
         'F1-Score (%)':  round(f1 * 100, 1),
-        'ROC AUC':       round(roc_auc, 1) if roc_auc is not None else 'N/A',
+        'ROC AUC':       round(roc_auc, 4) if roc_auc is not None else 'N/A',
         'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp
     }
 

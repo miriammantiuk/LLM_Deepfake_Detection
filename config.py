@@ -27,7 +27,6 @@ os.makedirs(RESULTS_FOLDER, exist_ok=True)
 # Maps technical model names to human-readable display names
 BASE_MODEL_DISPLAY_NAMES = {
     'gemini-3-flash-preview': 'Gemini 3 Flash',
-    'gpt5_2_instant':         'GPT 5.2',
     'gpt5_2':                 'GPT 5.2',
     'qwen3.5-397b-a17b':      'Qwen 3.5',
     'kimi-k2.5':              'Kimi k2.5',

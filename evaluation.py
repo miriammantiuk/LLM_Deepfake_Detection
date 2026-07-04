@@ -673,36 +673,39 @@ def run_global_baseline_roc_analysis(df_master):
         if model_group.empty:
             continue
             
-        all_y_true = []
-        all_y_prob = []
+        # Per-run ROC curves → averaged curve + mean AUC (consistent with benchmark)
+        per_run_fprs = []
+        per_run_tprs = []
         per_run_aucs = []
+        y_true_vec   = model_group['y_true'].tolist()
 
-        # Probabilities and labels from all runs
         for suffix in RUN_SUFFIXES:
             prob_col = f'probability_fake{suffix}'
-            if prob_col in model_group.columns:
-                probs = pd.to_numeric(model_group[prob_col], errors='coerce').fillna(0)
-                if probs.max() > 1.0:
-                    probs = probs / 100.0
-                y_true_run = model_group['y_true'].tolist()
-                all_y_prob.extend(probs.tolist())
-                all_y_true.extend(y_true_run)
-                # Per-run AUC for mean annotation (consistent with benchmark table)
-                try:
-                    r_fpr, r_tpr, _ = roc_curve(y_true_run, probs.tolist())
-                    per_run_aucs.append(auc(r_fpr, r_tpr))
-                except Exception:
-                    pass
+            if prob_col not in model_group.columns:
+                continue
+            probs = pd.to_numeric(model_group[prob_col], errors='coerce').fillna(0)
+            if probs.max() > 1.0:
+                probs = probs / 100.0
+            try:
+                fpr_r, tpr_r, _ = roc_curve(y_true_vec, probs.tolist())
+                per_run_fprs.append(fpr_r)
+                per_run_tprs.append(tpr_r)
+                per_run_aucs.append(auc(fpr_r, tpr_r))
+            except Exception:
+                pass
 
-        if all_y_prob:
+        if per_run_aucs:
             has_data = True
-            fpr, tpr, _ = roc_curve(all_y_true, all_y_prob)
-            # Use mean of per-run AUCs to match benchmark table
-            roc_auc_val = float(np.mean(per_run_aucs)) if per_run_aucs else auc(fpr, tpr)
+            # Interpolate each run's TPR to a shared FPR grid, then average
+            mean_fpr  = np.linspace(0, 1, 200)
+            mean_tpr  = np.mean(
+                [np.interp(mean_fpr, fpr_r, tpr_r)
+                 for fpr_r, tpr_r in zip(per_run_fprs, per_run_tprs)],
+                axis=0)
+            roc_auc_val = float(np.mean(per_run_aucs))
 
             color = get_model_color(tech_base_name)
-
-            plt.plot(fpr, tpr, color=color, lw=3,
+            plt.plot(mean_fpr, mean_tpr, color=color, lw=3,
                      label=f'{display_name} (AUC = {roc_auc_val:.2f})')
 
     if has_data:
@@ -1251,6 +1254,7 @@ def run_fairness_analysis(df_master):
                     tbl = [[(g['y_true']==g['y_pred']).sum(), (g['y_true']!=g['y_pred']).sum()],
                            [(rest['y_true']==rest['y_pred']).sum(), (rest['y_true']!=rest['y_pred']).sum()]]
                     
+                    # Fisher for small groups or sparse cells; Chi² for larger datasets
                     if (len(g) < 30) or any(v < 5 for r in tbl for v in r):
                         _, p = fisher_exact(tbl); test = "Fisher"
                     else:
@@ -1274,6 +1278,16 @@ def run_fairness_analysis(df_master):
 
     if all_results:
         df_res = pd.DataFrame(all_results).sort_values(['Run', 'Display_Name', 'P-Value'])
+
+        # BH-FDR correction per run (controls false discovery rate within each run's
+        # family of tests: all model × feature × group combinations)
+        adj_col = pd.Series(df_res['P-Value'].values.copy(), index=df_res.index)
+        for run in df_res['Run'].unique():
+            mask = df_res['Run'] == run
+            _, p_adj, _, _ = multipletests(df_res.loc[mask, 'P-Value'], method='fdr_bh')
+            adj_col.loc[mask] = p_adj
+        df_res['P-Value-adj (BH)'] = adj_col.round(4)
+
         df_res.to_excel(os.path.join(RESULTS_FOLDER, 'fairness_analysis.xlsx'), index=False)
         
         # Heatmaps (Bias)
@@ -1331,11 +1345,11 @@ def run_fairness_analysis(df_master):
 
         summary = (df_res.groupby(['Model', 'Feature', 'Group'])
                    .agg(
-                       Sig_Runs     = ('P-Value',        lambda x: (x < 0.05).sum()),
-                       P_Min        = ('P-Value',        'min'),
-                       P_Max        = ('P-Value',        'max'),
-                       CramerV_Mean = ("Cramér's V",     'mean'),
-                       Diff_Mean    = ('Diff to Global', 'mean'),
+                       Sig_Runs     = ('P-Value-adj (BH)', lambda x: (x < 0.05).sum()),
+                       P_Min        = ('P-Value-adj (BH)', 'min'),
+                       P_Max        = ('P-Value-adj (BH)', 'max'),
+                       CramerV_Mean = ("Cramér's V",       'mean'),
+                       Diff_Mean    = ('Diff to Global',   'mean'),
                    )
                    .reset_index())
         summary['Display_Name'] = summary['Model'].apply(get_plot_label)
@@ -1350,11 +1364,19 @@ def run_fairness_analysis(df_master):
         # Remove deepfake_type (redundant with deepfake_category)
         summary = summary[summary['Feature'] != 'deepfake_type'].copy()
 
+        # Identify truly binary features: exactly 2 unique groups across ALL models/runs
+        # (global check prevents collapsing multi-category features that happen to have
+        # only 2 groups surviving the n≥5 filter for one specific model)
+        binary_features = {
+            feat for feat in summary['Feature'].unique()
+            if summary[summary['Feature'] == feat]['Group'].nunique() == 2
+        }
+
         # Collapse binary features: both groups carry identical p/V → keep one row
         # labelled "A vs. B", retaining the group with larger |Diff_Mean|
         collapsed = []
         for (model, feat), grp in summary.groupby(['Model', 'Feature'], sort=False):
-            if len(grp) == 2:
+            if feat in binary_features and len(grp) == 2:
                 row = grp.loc[grp['Diff_Mean'].abs().idxmax()].copy()
                 labels = sorted(grp['Group'].tolist(), key=str.lower)
                 row['Group'] = f"{labels[0]} vs. {labels[1]}"
@@ -1396,7 +1418,8 @@ def run_fairness_analysis(df_master):
         # LaTeX export — 8 columns
         caption = (
             r'\caption{Signifikante Subgruppen der Fairness-Analyse '
-            r'(p\,<\,0{,}05 in mind.\,2\,von\,' + str(n_runs) + r'\,Runs; '
+            r'($p_{\text{adj}}<0{,}05$ in mind.\,2\,von\,' + str(n_runs) + r'\,Runs; '
+            r'Benjamini-Hochberg-FDR-Korrektur je Run; '
             r'\textit{deepfake\_type} ausgenommen)}'
         )
         tex_lines = [
