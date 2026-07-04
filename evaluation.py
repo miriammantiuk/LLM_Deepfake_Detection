@@ -383,7 +383,7 @@ def run_aggregation_and_benchmark():
     df_metrics = pd.DataFrame(results)
 
     # Map technical names to human-readable display names
-    df_metrics['Display_Name'] = df_metrics['Base_Model'].map(BASE_MODEL_DISPLAY_NAMES).fillna(df_metrics['Base_Model'])
+    df_metrics['Display_Name'] = df_metrics['Base_Model'].map(get_plot_label)
 
     # A) Detailed per-run report
     cols_order = ['Model', 'Display_Name', 'Type', 'Threshold', 'Accuracy (%)', 'F1-Score (%)', 'Videos']
@@ -594,7 +594,7 @@ def iterate_runs(df_master):
         df_run = df_master[cols_base + cols_run].copy()
         
         # Strip run suffix for uniform column access in all downstream functions
-        rename_dict = {c: c.replace(suffix, '') for c in cols_run}
+        rename_dict = {c: c[:-len(suffix)] for c in cols_run}
         # Ensure y_pred is always available under a consistent name
         rename_dict[col_pred] = 'y_pred' 
         
@@ -754,35 +754,39 @@ def run_family_variant_roc_comparison(df_master):
         model_variants_in_fam.sort(key=lambda x: next((i for i, v in enumerate(VARIANT_ORDER) if v in get_plot_label(x)), 99))
 
         for tech_model_name in model_variants_in_fam:
-            all_y_true = []
-            all_y_prob = []
-            
             model_rows = df_master[df_master['base_model'] == tech_model_name]
-            
+
+            per_run_fprs, per_run_tprs, per_run_aucs = [], [], []
             for r_suffix in RUN_SUFFIXES:
                 prob_col = f'probability_fake{r_suffix}'
-                if prob_col in model_rows.columns:
-                    # Only keep rows with both a ground truth label and a probability score
-                    temp_df = model_rows.dropna(subset=['y_true', prob_col])
-                    
-                    if not temp_df.empty:
-                        probs = pd.to_numeric(temp_df[prob_col], errors='coerce').fillna(0)
-                        if probs.max() > 1.0: probs = probs / 100.0
-                        
-                        all_y_prob.extend(probs.tolist())
-                        all_y_true.extend(temp_df['y_true'].astype(int).tolist())
-            
-            # Validate: require both classes present to compute AUC
-            if all_y_prob and len(np.unique(all_y_true)) > 1:
+                if prob_col not in model_rows.columns:
+                    continue
+                temp_df = model_rows.dropna(subset=['y_true', prob_col])
+                if temp_df.empty:
+                    continue
+                probs = pd.to_numeric(temp_df[prob_col], errors='coerce').fillna(0)
+                if probs.max() > 1.0:
+                    probs = probs / 100.0
+                y_true_run = temp_df['y_true'].astype(int).tolist()
+                if len(np.unique(y_true_run)) < 2:
+                    continue
+                try:
+                    fpr_r, tpr_r, _ = roc_curve(y_true_run, probs.tolist())
+                    per_run_fprs.append(fpr_r)
+                    per_run_tprs.append(tpr_r)
+                    per_run_aucs.append(auc(fpr_r, tpr_r))
+                except Exception:
+                    pass
+
+            if per_run_aucs:
                 has_plot_data = True
+                mean_fpr = np.linspace(0, 1, 200)
+                mean_tpr = np.mean([np.interp(mean_fpr, fpr_r, tpr_r)
+                                    for fpr_r, tpr_r in zip(per_run_fprs, per_run_tprs)], axis=0)
+                roc_auc_val = float(np.mean(per_run_aucs))
                 color = get_model_color(tech_model_name)
-                
                 label = get_plot_label(tech_model_name)
-                fpr, tpr, _ = roc_curve(all_y_true, all_y_prob)
-                roc_auc_val = auc(fpr, tpr)
-                
-                # Plot using the per-variant individual colour
-                plt.plot(fpr, tpr, color=color, lw=2.5,
+                plt.plot(mean_fpr, mean_tpr, color=color, lw=2.5,
                          label=f'{label} (AUC = {roc_auc_val:.2f})')
 
         if has_plot_data:
@@ -1189,13 +1193,14 @@ def run_fairness_analysis(df_master):
     if all_results:
         df_res = pd.DataFrame(all_results).sort_values(['Run', 'Display_Name', 'P-Value'])
 
-        # BH-FDR correction per run (controls false discovery rate within each run's
-        # family of tests: all model × feature × group combinations)
+        # BH-FDR correction per (model, run): family = all feature tests of one model
+        # within one run, matching the research question "is model X fair?"
         adj_col = pd.Series(df_res['P-Value'].values.copy(), index=df_res.index)
-        for run in df_res['Run'].unique():
-            mask = df_res['Run'] == run
-            _, p_adj, _, _ = multipletests(df_res.loc[mask, 'P-Value'], method='fdr_bh')
-            adj_col.loc[mask] = p_adj
+        for (run, model), grp in df_res.groupby(['Run', 'Display_Name']):
+            if len(grp) < 2:
+                continue
+            _, p_adj, _, _ = multipletests(grp['P-Value'], method='fdr_bh')
+            adj_col.loc[grp.index] = p_adj
         df_res['P-Value-adj (BH)'] = adj_col.round(4)
 
         df_res.to_excel(os.path.join(RESULTS_FOLDER, 'fairness_analysis.xlsx'), index=False)
@@ -2709,7 +2714,7 @@ def run_significance_tests(df_master):
 
     # Best single model: mean F1 across runs (identical to benchmark_scientific_report)
     def _mean_f1(key):
-        rows = df_master[df_master['base_model'] == key].drop_duplicates('video_id')
+        rows = df_master[df_master['base_model'] == key]
         if rows.empty:
             return 0.0
         f1s = []
