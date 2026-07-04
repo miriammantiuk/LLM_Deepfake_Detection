@@ -812,19 +812,97 @@ def run_feature_importance_analysis(df_master):
     """
     print("\n=== Feature Importance (Stacked Bar + Swarm, Per Run & Feature) ===")
 
-    # Baseline models only (no +I / +T variants)
     baseline_keys = [k for k in BASE_MODEL_DISPLAY_NAMES
                      if '_indicators' not in k and '_thinking' not in k]
 
+    # ── shared plot helpers ───────────────────────────────────────────────────
+
+    def _plot_swarm(feat, models, df_long, save_dir, title):
+        """Box/strip plot for numeric features. df_long must have Model/feat/Outcome cols."""
+        n = len(models)
+        palette = {'Korrekt': '#2ca02c', 'Fehler': '#d62728'}
+        fig, axes_grid = plt.subplots(1, n, figsize=(2.5 * n, 4.5),
+                                      sharey=True, squeeze=False)
+        for idx, (ax, model) in enumerate(zip(axes_grid.flatten(), models)):
+            sub = df_long[df_long['Model'] == model].dropna(subset=[feat])
+            sns.boxplot(data=sub, x='Outcome', y=feat, ax=ax, palette=palette,
+                        width=0.4, order=['Korrekt', 'Fehler'],
+                        showfliers=False, linewidth=1.2)
+            sns.stripplot(data=sub, x='Outcome', y=feat, ax=ax, palette=palette,
+                          size=4, alpha=0.7, jitter=True, order=['Korrekt', 'Fehler'])
+            ax.set_title(model, fontweight='bold')
+            ax.set_xlabel('')
+            ax.set_ylabel(feat if idx == 0 else '')
+        for ax in axes_grid.flatten()[n:]:
+            ax.set_visible(False)
+        fig.suptitle(title, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f'Swarm_{feat}.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def _plot_stacked_bar(feat, models, prop_dfs, categories, save_dir, title):
+        """Stacked bar chart for categorical features.
+
+        prop_dfs: dict {model_name: DataFrame(index=Group,
+                        columns=['Korrekt','Fehler','N','Std'])}
+        Error bars are drawn when Std > 0.
+        """
+        max_label_len = max(len(c) for c in categories)
+        n_cats = len(categories)
+        if max_label_len <= 5:
+            tick_rotation, tick_ha, bottom_margin = 0, 'center', 0.20
+        elif max_label_len <= 18:
+            tick_rotation, tick_ha, bottom_margin = 45, 'right', 0.40
+        else:
+            tick_rotation, tick_ha, bottom_margin = 90, 'right', 0.52
+        fig_height = 5.5 if n_cats > 6 else 4.5
+        n = len(models)
+        fig, axes_grid = plt.subplots(1, n, figsize=(2.5 * n, fig_height), squeeze=False)
+        axes = axes_grid.flatten()
+        for idx, (ax, model) in enumerate(zip(axes, models)):
+            df_prop = prop_dfs[model]
+            df_prop[['Korrekt', 'Fehler']].plot(
+                kind='bar', stacked=True, ax=ax,
+                color=['#2ca02c', '#d62728'],
+                edgecolor='white', linewidth=0.5, legend=False)
+            for i, row in enumerate(df_prop.itertuples()):
+                if row.Std > 0:
+                    ax.errorbar(i, row.Korrekt, yerr=row.Std,
+                                fmt='none', color='black', capsize=4,
+                                linewidth=1.5, zorder=5)
+            if n_cats <= 6:
+                for i, row in enumerate(df_prop.itertuples()):
+                    ax.text(i, 103, f'n={int(row.N)}', ha='center', va='bottom',
+                            fontsize=9, color='gray')
+            ax.set_title(model, fontweight='bold', pad=6)
+            ax.set_xlabel('')
+            ax.set_ylabel('Anteil (%)' if idx == 0 else '')
+            ax.set_ylim(0, 118)
+            ax.axhline(50, color='gray', linewidth=0.8, linestyle='--', alpha=0.6)
+            plt.setp(ax.get_xticklabels(), rotation=tick_rotation, ha=tick_ha)
+            if idx > 0:
+                ax.tick_params(left=False)
+                ax.yaxis.set_ticklabels([])
+                ax.spines['left'].set_visible(False)
+        for ax in axes[n:]:
+            ax.set_visible(False)
+        plt.subplots_adjust(top=0.82, bottom=bottom_margin,
+                            left=0.10, right=0.98, wspace=0.05)
+        fig.suptitle(title, fontweight='bold')
+        plt.savefig(os.path.join(save_dir, f'StackedBar_{feat}.png'),
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+
+    # ── PER-RUN ──────────────────────────────────────────────────────────────
+
     for run_label, df_run in iterate_runs(df_master):
         print(f" -> {run_label}...")
-
         save_dir = os.path.join(base_plot_folder, run_label, 'Feature_Importance')
         os.makedirs(save_dir, exist_ok=True)
 
         df_run = df_run[df_run['base_model'].isin(baseline_keys)].copy()
-        df_run['correct'] = (df_run['y_pred'] == df_run['y_true']).astype(int)
-        df_run['Outcome'] = df_run['correct'].map({1: 'Korrekt', 0: 'Fehler'})
+        df_run['Outcome'] = (df_run['y_pred'] == df_run['y_true']).map(
+            {True: 'Korrekt', False: 'Fehler'})
         df_run['Model'] = df_run['base_model'].apply(get_plot_label)
 
         if df_run.empty:
@@ -832,141 +910,42 @@ def run_feature_importance_analysis(df_master):
             continue
 
         models_ordered = sorted(df_run['Model'].unique(), key=str.lower)
-        n_models = len(models_ordered)
-
-        # Single row layout — smaller per-panel size keeps 14pt font proportionally large
-        n_cols = n_models
-        n_rows = 1
 
         for feat in META_COLS:
             if feat not in df_run.columns:
                 continue
-
-            # Binary 0/1 columns treated as categorical
-            is_numeric = pd.api.types.is_numeric_dtype(df_run[feat]) and df_run[feat].nunique() > 2
-
+            is_numeric = (pd.api.types.is_numeric_dtype(df_run[feat])
+                          and df_run[feat].nunique() > 2)
             if is_numeric:
-                # ── SWARMPLOT (Strip + Box) ──────────────────────────────────
-                fig, axes_grid = plt.subplots(
-                    n_rows, n_cols,
-                    figsize=(2.5 * n_cols, 4.5),
-                    sharey=True, squeeze=False
-                )
-                axes = axes_grid.flatten()
-
-                for idx, (ax, model) in enumerate(zip(axes, models_ordered)):
-                    sub = df_run[df_run['Model'] == model].dropna(subset=[feat])
-                    palette = {'Korrekt': '#2ca02c', 'Fehler': '#d62728'}
-
-                    sns.boxplot(data=sub, x='Outcome', y=feat, ax=ax,
-                                palette=palette, width=0.4, order=['Korrekt', 'Fehler'],
-                                showfliers=False, linewidth=1.2)
-                    sns.stripplot(data=sub, x='Outcome', y=feat, ax=ax,
-                                  palette=palette, size=4, alpha=0.7, jitter=True,
-                                  order=['Korrekt', 'Fehler'])
-
-                    ax.set_title(model, fontweight='bold')
-                    ax.set_xlabel('')
-                    ax.set_ylabel(feat if idx % n_cols == 0 else '')
-
-                # Hide unused panels in the last row
-                for ax in axes[n_models:]:
-                    ax.set_visible(False)
-
-                fig.suptitle(f'{run_label} – Verteilung „{feat}" nach Klassifikationsergebnis',
-                             fontweight='bold')
-                plt.tight_layout()
-                plt.savefig(os.path.join(save_dir, f'Swarm_{feat}.png'), dpi=300, bbox_inches='tight')
-                plt.close()
-
+                _plot_swarm(feat, models_ordered, df_run, save_dir,
+                            f'{run_label} – Verteilung „{feat}" nach Klassifikationsergebnis')
             else:
-                # ── VERTICAL STACKED BAR CHART ───────────────────────────────
-                # Derive rotation + bottom margin from longest category label
                 categories = sorted(df_run[feat].dropna().unique().astype(str))
-                max_label_len = max(len(c) for c in categories)
-                n_cats = len(categories)
-
-                if max_label_len <= 5:
-                    tick_rotation, tick_ha, bottom_margin = 0, 'center', 0.20
-                elif max_label_len <= 18:
-                    tick_rotation, tick_ha, bottom_margin = 45, 'right', 0.40
-                else:
-                    tick_rotation, tick_ha, bottom_margin = 90, 'right', 0.52
-
-                # Taller figure when many categories need vertical label space
-                fig_height = 5.5 if n_cats > 6 else 4.5
-
-                fig, axes_grid = plt.subplots(
-                    n_rows, n_cols,
-                    figsize=(2.5 * n_cols, fig_height),
-                    squeeze=False
-                )
-                axes = axes_grid.flatten()
-
-                for idx, (ax, model) in enumerate(zip(axes, models_ordered)):
+                prop_dfs = {}
+                for model in models_ordered:
                     sub = df_run[df_run['Model'] == model].dropna(subset=[feat])
-
                     counts = (sub.groupby([feat, 'Outcome'], observed=False)
-                                .size()
-                                .unstack(fill_value=0)
-                                .sort_index())
-
+                              .size().unstack(fill_value=0).sort_index())
                     for col in ['Korrekt', 'Fehler']:
                         if col not in counts.columns:
                             counts[col] = 0
+                    df_prop = counts.div(counts.sum(axis=1), axis=0) * 100
+                    df_prop = df_prop[['Korrekt', 'Fehler']].copy()
+                    df_prop['N']   = counts.sum(axis=1).astype(int)
+                    df_prop['Std'] = 0.0
+                    prop_dfs[model] = df_prop
+                _plot_stacked_bar(feat, models_ordered, prop_dfs, categories, save_dir,
+                                  f'{run_label} – Klassifikationsergebnis nach „{feat}"')
 
-                    counts_pct = counts.div(counts.sum(axis=1), axis=0) * 100
-                    counts_pct = counts_pct[['Korrekt', 'Fehler']]
+    # ── AVERAGED ACROSS RUNS ──────────────────────────────────────────────────
 
-                    counts_pct.plot(
-                        kind='bar', stacked=True, ax=ax,
-                        color=['#2ca02c', '#d62728'],
-                        edgecolor='white', linewidth=0.5,
-                        legend=False
-                    )
-
-                    # n= annotation above each bar; skip when too many categories
-                    if n_cats <= 6:
-                        for i, (_, row) in enumerate(counts.iterrows()):
-                            n_total = int(row.sum())
-                            ax.text(i, 103, f'n={n_total}', ha='center', va='bottom',
-                                    fontsize=9, color='gray')
-
-                    ax.set_title(model, fontweight='bold', pad=6)
-                    ax.set_xlabel('')
-                    ax.set_ylabel('Anteil (%)' if idx == 0 else '')
-                    ax.set_ylim(0, 118)
-                    ax.axhline(50, color='gray', linewidth=0.8, linestyle='--', alpha=0.6)
-                    plt.setp(ax.get_xticklabels(), rotation=tick_rotation, ha=tick_ha)
-
-                    if idx > 0:
-                        ax.tick_params(left=False)
-                        ax.yaxis.set_ticklabels([])
-                        ax.spines['left'].set_visible(False)
-
-                # Hide unused panels
-                for ax in axes[n_models:]:
-                    ax.set_visible(False)
-
-                plt.subplots_adjust(top=0.82, bottom=bottom_margin,
-                                    left=0.10, right=0.98, wspace=0.05)
-
-                fig.suptitle(f'{run_label} – Klassifikationsergebnis nach „{feat}"',
-                             fontweight='bold')
-
-                plt.savefig(os.path.join(save_dir, f'StackedBar_{feat}.png'),
-                            dpi=300, bbox_inches='tight')
-                plt.close()
-
-    # ── AVERAGED ACROSS RUNS ────────────────────────────────────────────────
     print(" -> Alle_Runs (gemittelte Feature-Importance)...")
-    pred_cols = [f'y_pred{s}' for s in RUN_SUFFIXES]
+    pred_cols  = [f'y_pred{s}' for s in RUN_SUFFIXES]
     avail_pred = [c for c in pred_cols if c in df_master.columns]
     if len(avail_pred) >= 2:
         df_base_all = df_master[df_master['base_model'].isin(baseline_keys)].copy()
         df_base_all['Model'] = df_base_all['base_model'].apply(get_plot_label)
-        models_avg = sorted(df_base_all['Model'].unique(), key=str.lower)
-        n_cols_avg = len(models_avg)
+        models_avg  = sorted(df_base_all['Model'].unique(), key=str.lower)
         save_dir_avg = os.path.join(base_plot_folder, 'Alle_Runs', 'Feature_Importance')
         os.makedirs(save_dir_avg, exist_ok=True)
 
@@ -976,7 +955,6 @@ def run_feature_importance_analysis(df_master):
             is_numeric = (pd.api.types.is_numeric_dtype(df_base_all[feat])
                           and df_base_all[feat].nunique() > 2)
             if is_numeric:
-                # Pool all runs into one combined box/swarm plot
                 frames = []
                 for col in avail_pred:
                     tmp = df_base_all[['Model', feat, 'y_true', col]].dropna().copy()
@@ -984,54 +962,19 @@ def run_feature_importance_analysis(df_master):
                         {True: 'Korrekt', False: 'Fehler'})
                     frames.append(tmp[['Model', feat, 'Outcome']])
                 df_long = pd.concat(frames, ignore_index=True)
-                palette = {'Korrekt': '#2ca02c', 'Fehler': '#d62728'}
-                fig, axes_grid = plt.subplots(1, n_cols_avg,
-                                              figsize=(2.5 * n_cols_avg, 4.5),
-                                              sharey=True, squeeze=False)
-                for idx, (ax, model) in enumerate(zip(axes_grid.flatten(), models_avg)):
-                    sub = df_long[df_long['Model'] == model].dropna(subset=[feat])
-                    sns.boxplot(data=sub, x='Outcome', y=feat, ax=ax, palette=palette,
-                                width=0.4, order=['Korrekt', 'Fehler'],
-                                showfliers=False, linewidth=1.2)
-                    sns.stripplot(data=sub, x='Outcome', y=feat, ax=ax, palette=palette,
-                                  size=4, alpha=0.7, jitter=True,
-                                  order=['Korrekt', 'Fehler'])
-                    ax.set_title(model, fontweight='bold')
-                    ax.set_xlabel('')
-                    ax.set_ylabel(feat if idx == 0 else '')
-                for ax in axes_grid.flatten()[n_cols_avg:]:
-                    ax.set_visible(False)
-                fig.suptitle(
-                    f'Alle Runs – Verteilung „{feat}" nach Klassifikationsergebnis',
-                    fontweight='bold')
-                plt.tight_layout()
-                plt.savefig(os.path.join(save_dir_avg, f'Swarm_{feat}.png'),
-                            dpi=300, bbox_inches='tight')
-                plt.close()
+                _plot_swarm(feat, models_avg, df_long, save_dir_avg,
+                            f'Alle Runs – Verteilung „{feat}" nach Klassifikationsergebnis')
             else:
-                # Mean proportion correct per (model, group) across runs → stacked bar
                 categories = sorted(df_base_all[feat].dropna().unique().astype(str))
-                max_label_len = max(len(c) for c in categories)
-                n_cats = len(categories)
-                if max_label_len <= 5:
-                    tick_rotation, tick_ha, bottom_margin = 0, 'center', 0.20
-                elif max_label_len <= 18:
-                    tick_rotation, tick_ha, bottom_margin = 45, 'right', 0.40
-                else:
-                    tick_rotation, tick_ha, bottom_margin = 90, 'right', 0.52
-                fig_height = 5.5 if n_cats > 6 else 4.5
-                fig, axes_grid = plt.subplots(1, n_cols_avg,
-                                              figsize=(2.5 * n_cols_avg, fig_height),
-                                              squeeze=False)
-                axes = axes_grid.flatten()
-                for idx, (ax, model) in enumerate(zip(axes, models_avg)):
+                prop_dfs = {}
+                for model in models_avg:
                     sub = df_base_all[df_base_all['Model'] == model].dropna(subset=[feat])
-                    prop_rows = []
+                    rows = []
                     for group_val in categories:
                         grp = sub[sub[feat].astype(str) == group_val]
                         if grp.empty:
-                            prop_rows.append({'Group': group_val, 'Korrekt': 0.0,
-                                              'Fehler': 100.0, 'N': 0, 'Std': 0.0})
+                            rows.append({'Group': group_val, 'Korrekt': 0.0,
+                                         'Fehler': 100.0, 'N': 0, 'Std': 0.0})
                             continue
                         pcts = []
                         for col in avail_pred:
@@ -1041,44 +984,11 @@ def run_feature_importance_analysis(df_master):
                                     (col_grp[col] == col_grp['y_true']).mean() * 100)
                         mean_c = float(np.mean(pcts)) if pcts else 0.0
                         std_c  = float(np.std(pcts, ddof=1)) if len(pcts) >= 2 else 0.0
-                        prop_rows.append({'Group': group_val, 'Korrekt': mean_c,
-                                          'Fehler': 100.0 - mean_c,
-                                          'N': len(grp), 'Std': std_c})
-                    df_prop = pd.DataFrame(prop_rows).set_index('Group')
-                    df_prop[['Korrekt', 'Fehler']].plot(
-                        kind='bar', stacked=True, ax=ax,
-                        color=['#2ca02c', '#d62728'],
-                        edgecolor='white', linewidth=0.5, legend=False)
-                    # Error bars at the green/red boundary (= mean proportion correct)
-                    for i, row in enumerate(df_prop.itertuples()):
-                        if row.Std > 0:
-                            ax.errorbar(i, row.Korrekt, yerr=row.Std,
-                                        fmt='none', color='black', capsize=4,
-                                        linewidth=1.5, zorder=5)
-                    if n_cats <= 6:
-                        for i, row in enumerate(df_prop.itertuples()):
-                            ax.text(i, 103, f'n={int(row.N)}',
-                                    ha='center', va='bottom', fontsize=9, color='gray')
-                    ax.set_title(model, fontweight='bold', pad=6)
-                    ax.set_xlabel('')
-                    ax.set_ylabel('Anteil (%)' if idx == 0 else '')
-                    ax.set_ylim(0, 118)
-                    ax.axhline(50, color='gray', linewidth=0.8, linestyle='--', alpha=0.6)
-                    plt.setp(ax.get_xticklabels(), rotation=tick_rotation, ha=tick_ha)
-                    if idx > 0:
-                        ax.tick_params(left=False)
-                        ax.yaxis.set_ticklabels([])
-                        ax.spines['left'].set_visible(False)
-                for ax in axes[n_cols_avg:]:
-                    ax.set_visible(False)
-                plt.subplots_adjust(top=0.82, bottom=bottom_margin,
-                                    left=0.10, right=0.98, wspace=0.05)
-                fig.suptitle(
-                    f'Alle Runs – Klassifikationsergebnis nach „{feat}" (Mittelwert)',
-                    fontweight='bold')
-                plt.savefig(os.path.join(save_dir_avg, f'StackedBar_{feat}.png'),
-                            dpi=300, bbox_inches='tight')
-                plt.close()
+                        rows.append({'Group': group_val, 'Korrekt': mean_c,
+                                     'Fehler': 100.0 - mean_c, 'N': len(grp), 'Std': std_c})
+                    prop_dfs[model] = pd.DataFrame(rows).set_index('Group')
+                _plot_stacked_bar(feat, models_avg, prop_dfs, categories, save_dir_avg,
+                                  f'Alle Runs – Klassifikationsergebnis nach „{feat}" (Mittelwert)')
 
 
 def run_feature_analysis(df_master):
