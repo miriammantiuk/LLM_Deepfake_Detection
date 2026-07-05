@@ -6,25 +6,25 @@ import cv2
 from openai import OpenAI
 
 # =========================
-# API-Setup
+# API setup
 # =========================
 api_key = os.getenv("MOONSHOT_API_KEY")
 if not api_key:
-    raise RuntimeError("MOONSHOT_API_KEY Umgebungsvariable nicht gesetzt.")
+    raise RuntimeError("MOONSHOT_API_KEY environment variable not set.")
 
 client = OpenAI(
     api_key=api_key,
     base_url="https://api.moonshot.ai/v1",
 )
 
-# Kimi 2.5 Modell
+# Kimi 2.5 model
 model = "kimi-k2.5"
 
-# Thinking-Konfiguration
-thinking_type = "disabled"  # "enabled" reasoning, "disabled" für kein reasoning
+# Thinking configuration
+thinking_type = "disabled"  # "enabled" = reasoning, "disabled" = no reasoning
 
-# Indicators-Konfiguration
-indicators_type = "disabled"  # "enabled" für indicators, "disabled" für baseline
+# Indicators configuration
+indicators_type = "disabled"  # "enabled" for indicators prompt, "disabled" for baseline
 
 suffix_parts = []
 if thinking_type == "enabled":
@@ -54,7 +54,7 @@ prompt_baseline = """<role>
                         <constraints>
                         - Do NOT output explanations outside the JSON.
                         - Keep the justification concise, factual, and forensic.
-                        </constraints>        
+                        </constraints>
                         """
 
 prompt_indicators = """<role>
@@ -97,16 +97,16 @@ prompt_text = prompt_indicators if add_indicators else prompt_baseline
 
 
 # =========================
-# Pfade
+# Paths
 # =========================
 video_ordner = Path(r"C:\Users\miria\Deepfake_Detection\data\processed")
 output_datei = Path(rf"C:\Users\miria\Deepfake_Detection\{model}{suffix}_3.json")
 
 # =========================
-# Hilfsfunktionen
+# Helper functions
 # =========================
 def clean_json_text(text: str) -> str:
-    """Bereinigt ggf. Markdown-Codeblöcke um JSON-Text."""
+    """Strips markdown code blocks from JSON response text."""
     text = text.strip()
     if text.startswith("```"):
         parts = text.split("```")
@@ -121,7 +121,7 @@ def save_results(path: Path, results: list) -> None:
         json.dump(results, f, indent=2, ensure_ascii=False)
 
 # =========================
-# Bereits vorhandene Ergebnisse laden
+# Load existing results
 # =========================
 alle_ergebnisse = []
 vorhandene_video_ids = set()
@@ -135,26 +135,26 @@ if output_datei.exists():
                 for entry in alle_ergebnisse
                 if isinstance(entry, dict) and "video_id" in entry
             }
-        print(f"Geladene bestehende Ergebnisse: {len(alle_ergebnisse)} Videos")
+        print(f"Loaded existing results: {len(alle_ergebnisse)} videos")
     except json.JSONDecodeError:
-        print("Fehler beim Laden der bestehenden JSON-Datei. Starte mit leerer Liste.")
+        print("Error loading existing JSON file. Starting with empty list.")
 
 # =========================
-# Analysiere alle MP4-Dateien rekursiv
+# Process all MP4 files (recursive)
 # =========================
 for video_pfad in video_ordner.glob("**/*.mp4"):
     video_id = video_pfad.stem
 
     if video_id in vorhandene_video_ids:
-        print(f"--- Überspringe {video_pfad.name} (bereits analysiert) ---")
+        print(f"--- Skipping {video_pfad.name} (already processed) ---")
         continue
 
-    print(f"\n--- Analysiere: {video_pfad.name} ---")
+    print(f"\n--- Processing: {video_pfad.name} ---")
 
-    # Video-Überprüfung
+    # Validate video
     cap = cv2.VideoCapture(str(video_pfad))
     if not cap.isOpened():
-        print("Fehler: Video konnte nicht geladen werden.")
+        print("Error: could not open video.")
         cap.release()
         continue
 
@@ -163,8 +163,8 @@ for video_pfad in video_ordner.glob("**/*.mp4"):
     prompt_text = (prompt_indicators if add_indicators else prompt_baseline).format(video_id=video_id).strip()
 
     try:
-        # 1) Video zu Moonshot hochladen
-        print("Lade Video zu Moonshot hoch ...")
+        # 1) Upload video to Moonshot
+        print("Uploading video to Moonshot...")
         uploaded_file = client.files.create(
             file=video_pfad,
             purpose="video",
@@ -172,7 +172,7 @@ for video_pfad in video_ordner.glob("**/*.mp4"):
 
         video_url = f"ms://{uploaded_file.id}"
 
-        # 2) Anfrage an Kimi 2.5
+        # 2) Request to Kimi 2.5
         completion = client.chat.completions.create(
             model=model,
             response_format={"type": "json_object"},
@@ -195,31 +195,31 @@ for video_pfad in video_ordner.glob("**/*.mp4"):
             ],
             extra_body={
                     "thinking": {"type": thinking_type}
-            }, # Kimi 2.5 nutzt standardmäßig "reasoning"
+            },  # Kimi 2.5 uses "reasoning" by default
         )
 
         response_text = completion.choices[0].message.content
         if not response_text:
-            print(f"API-Fehler: Leere Antwort für {video_pfad.name}")
+            print(f"API error: empty response for {video_pfad.name}")
             continue
 
         response_text = clean_json_text(response_text)
-        print(f"API-Antwort: {response_text}")
+        print(f"API response: {response_text}")
 
         result = json.loads(response_text)
 
-        # Sicherheitsnetz: video_id notfalls setzen/korrigieren
+        # Fallback: ensure video_id is set correctly
         result["video_id"] = video_id
 
         alle_ergebnisse.append(result)
         vorhandene_video_ids.add(video_id)
 
-        # Nach jedem erfolgreichen Video speichern
+        # Save incrementally after each successful video
         save_results(output_datei, alle_ergebnisse)
-        print("✓ Erfolgreich geparst und gespeichert")
+        print("✓ Successfully parsed and saved")
 
     except Exception as e:
-        print(f"Fehler bei {video_pfad.name}: {e}")
+        print(f"Error processing {video_pfad.name}: {e}")
         continue
 
-print(f"\nErgebnisse gespeichert in: {output_datei}")
+print(f"\nResults saved to: {output_datei}")

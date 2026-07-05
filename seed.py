@@ -6,11 +6,11 @@ import cv2
 from openai import OpenAI
 
 # =========================
-# API-Setup (OpenRouter)
+# API setup (OpenRouter)
 # =========================
 api_key = os.getenv("OPENROUTER_API_KEY")
 if not api_key:
-    raise RuntimeError("OPENROUTER_API_KEY Umgebungsvariable nicht gesetzt.")
+    raise RuntimeError("OPENROUTER_API_KEY environment variable not set.")
 
 client = OpenAI(
     api_key=api_key,
@@ -19,11 +19,11 @@ client = OpenAI(
 
 model = "bytedance-seed/seed-2.0-lite"
 
-# Thinking-Konfiguration
-thinking_type = False  # True reasoning, False für kein reasoning
+# Thinking configuration
+thinking_type = False  # True = reasoning enabled, False = disabled
 
-# Indicators-Konfiguration
-indicators_type = "disabled"  # "enabled" für indicators, "disabled" für baseline
+# Indicators configuration
+indicators_type = "disabled"  # "enabled" for indicators prompt, "disabled" for baseline
 
 suffix_parts = []
 if thinking_type == True:
@@ -56,7 +56,7 @@ prompt_baseline = """<role>
                         <constraints>
                         - Do NOT output explanations outside the JSON.
                         - Keep the justification concise, factual, and forensic.
-                        </constraints>        
+                        </constraints>
                         """
 
 prompt_indicators = """<role>
@@ -94,16 +94,16 @@ prompt_indicators = """<role>
                         </constraints>"""
 
 # =========================
-# Pfade
+# Paths
 # =========================
 video_ordner = Path(r"C:\Users\miria\Deepfake_Detection\data\processed")
 output_datei = Path(rf"C:\Users\miria\Deepfake_Detection\{model.split('/')[-1]}{suffix}_3.json")
 
 # =========================
-# Hilfsfunktionen
+# Helper functions
 # =========================
 def encode_video_to_base64(video_path: Path) -> str:
-    """Liest die Videodatei und konvertiert sie in einen Base64-String."""
+    """Reads the video file and returns it as a Base64-encoded string."""
     with open(video_path, "rb") as video_file:
         return base64.b64encode(video_file.read()).decode("utf-8")
 
@@ -122,7 +122,7 @@ def save_results(path: Path, results: list) -> None:
         json.dump(results, f, indent=2, ensure_ascii=False)
 
 # =========================
-# Bereits vorhandene Ergebnisse laden
+# Load existing results
 # =========================
 alle_ergebnisse = []
 vorhandene_video_ids = set()
@@ -136,26 +136,26 @@ if output_datei.exists():
                 for entry in alle_ergebnisse
                 if isinstance(entry, dict) and "video_id" in entry
             }
-        print(f"Geladene bestehende Ergebnisse: {len(alle_ergebnisse)} Videos")
+        print(f"Loaded existing results: {len(alle_ergebnisse)} videos")
     except json.JSONDecodeError:
-        print("Fehler beim Laden der bestehenden JSON-Datei. Starte neu.")
+        print("Error loading existing JSON file. Starting fresh.")
 
 # =========================
-# Analysiere alle MP4-Dateien
+# Process all MP4 files (recursive)
 # =========================
 for video_pfad in video_ordner.glob("**/*.mp4"):
     video_id = video_pfad.stem
 
     if video_id in vorhandene_video_ids:
-        print(f"--- Überspringe {video_pfad.name} (bereits analysiert) ---")
+        print(f"--- Skipping {video_pfad.name} (already processed) ---")
         continue
 
-    print(f"\n--- Analysiere mit Seed-2.0-Lite: {video_pfad.name} ---")
+    print(f"\n--- Processing with Seed-2.0-Lite: {video_pfad.name} ---")
 
-    # Lokale Videoüberprüfung
+    # Validate video
     cap = cv2.VideoCapture(str(video_pfad))
     if not cap.isOpened():
-        print("Fehler: Video konnte nicht geladen werden.")
+        print("Error: could not open video.")
         cap.release()
         continue
     cap.release()
@@ -163,11 +163,11 @@ for video_pfad in video_ordner.glob("**/*.mp4"):
     prompt_text = (prompt_indicators if add_indicators else prompt_baseline).format(video_id=video_id).strip()
 
     try:
-        # Video für API-Übertragung vorbereiten (Base64)
-        print("Bereite Video-Daten vor...")
+        # Encode video as Base64 for API transfer
+        print("Preparing video data...")
         video_base64 = encode_video_to_base64(video_pfad)
 
-        # Anfrage an OpenRouter - Korrigiert für Seed-2.0-lite
+        # Request to OpenRouter (Seed-2.0-lite)
         completion = client.chat.completions.create(
             model=model,
             messages=[
@@ -175,7 +175,7 @@ for video_pfad in video_ordner.glob("**/*.mp4"):
                     "role": "user",
                     "content": [
                         {
-                            "type": "text", 
+                            "type": "text",
                             "text": prompt_text
                         },
                         {
@@ -194,11 +194,11 @@ for video_pfad in video_ordner.glob("**/*.mp4"):
 
         response_text = completion.choices[0].message.content
         if not response_text:
-            print(f"Fehler: Keine Antwort von OpenRouter für {video_pfad.name}")
+            print(f"Error: empty response from OpenRouter for {video_pfad.name}")
             continue
 
         response_text = clean_json_text(response_text)
-        print(f"API-Antwort: {response_text}")
+        print(f"API response: {response_text}")
 
         result = json.loads(response_text)
         result["video_id"] = video_id
@@ -207,10 +207,10 @@ for video_pfad in video_ordner.glob("**/*.mp4"):
         vorhandene_video_ids.add(video_id)
 
         save_results(output_datei, alle_ergebnisse)
-        print(f"✓ {video_id} erfolgreich analysiert.")
+        print(f"✓ {video_id} successfully processed.")
 
     except Exception as e:
-        print(f"Kritischer Fehler bei {video_pfad.name}: {e}")
+        print(f"Critical error processing {video_pfad.name}: {e}")
         continue
 
-print(f"\nFertig! Ergebnisse in: {output_datei}")
+print(f"\nDone! Results saved to: {output_datei}")

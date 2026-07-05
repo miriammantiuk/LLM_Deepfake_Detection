@@ -4,23 +4,23 @@ import json
 from pathlib import Path
 import cv2
 
-# API-Setup
+# API setup
 dashscope.base_http_api_url = 'https://dashscope-intl.aliyuncs.com/api/v1'
 api_key = os.getenv("QWEN_API_KEY")
 if not api_key:
-    raise RuntimeError("QWEN_API_KEY Umgebungsvariable nicht gesetzt.")
+    raise RuntimeError("QWEN_API_KEY environment variable not set.")
 
-# Wähle das Modell
+# Select model
 # model='qwen3-vl-32b-instruct',
 # model='qwen3-vl-235b-a22b-instruct',
 # model='qwen3-vl-235b-a22b-thinking'
 model='qwen3.5-397b-a17b'
 
-# Thinking-Konfiguration
-enable_thinking = True  # True reasoning, False für kein reasoning
+# Thinking configuration
+enable_thinking = True  # True = reasoning enabled, False = disabled
 
-# Indicators-Konfiguration
-indicators_type = "disabled"  # "enabled" für indicators, "disabled" für baseline
+# Indicators configuration
+indicators_type = "disabled"  # "enabled" for indicators prompt, "disabled" for baseline
 
 suffix_parts = []
 if enable_thinking:
@@ -53,7 +53,7 @@ prompt_baseline = """<role>
                         <constraints>
                         - Do NOT output explanations outside the JSON.
                         - Keep the justification concise, factual, and forensic.
-                        </constraints>        
+                        </constraints>
                         """
 
 prompt_indicators = """<role>
@@ -90,7 +90,7 @@ prompt_indicators = """<role>
                         - Keep the justification concise, factual, and forensic.
                         </constraints>"""
 
-# Pfad zu den Videos
+# Path to videos
 video_ordner = Path(r"C:\Users\miria\Deepfake_Detection\data\processed")
 output_datei = Path(rf"C:\Users\miria\Deepfake_Detection\{model}{suffix}_3.json")
 
@@ -101,30 +101,30 @@ if output_datei.exists():
         with open(output_datei, 'r', encoding='utf-8') as f:
             alle_ergebnisse = json.load(f)
             vorhandene_video_ids = {entry.get("video_id") for entry in alle_ergebnisse if "video_id" in entry}
-        print(f"Geladene bestehende Ergebnisse: {len(alle_ergebnisse)} Videos")
+        print(f"Loaded existing results: {len(alle_ergebnisse)} videos")
     except json.JSONDecodeError:
-        print("Fehler beim Laden der bestehenden JSON-Datei. Starte mit leerer Liste.")
+        print("Error loading existing JSON file. Starting with empty list.")
 
-# Analysiere alle MP4-Dateien im Ordner (rekursiv in Unterordnern)
+# Process all MP4 files in the folder (recursive)
 for video_pfad in video_ordner.glob("**/*.mp4"):
     video_id = video_pfad.stem
     if video_id in vorhandene_video_ids:
-        print(f"--- Überspringe {video_pfad.name} (bereits analysiert) ---")
+        print(f"--- Skipping {video_pfad.name} (already processed) ---")
         continue
-    
-    print(f"\n--- Analysiere: {video_pfad.name} ---")
-    # Video-Überprüfung
+
+    print(f"\n--- Processing: {video_pfad.name} ---")
+    # Validate video
     cap = cv2.VideoCapture(str(video_pfad))
     if not cap.isOpened():
-        print("Fehler: Video konnte nicht geladen werden.")
+        print("Error: could not open video.")
         cap.release()
         continue
     frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
-    print(f"Video geladen: {frames} Frames bei {fps} FPS")
+    print(f"Video loaded: {frames} frames at {fps} FPS")
     cap.release()
-    
-    video_id = video_pfad.stem  # Extrahiere die Video-ID hier
+
+    video_id = video_pfad.stem
 
     prompt_text = (prompt_indicators if add_indicators else prompt_baseline).format(video_id=video_id)
 
@@ -134,48 +134,48 @@ for video_pfad in video_ordner.glob("**/*.mp4"):
             {
                 "role": "user",
                 "content": [
-                    {"video": str(video_pfad), "fps": 2}, #Standardmäßig 2 fps um API-Token zu sparen. Kann je nach Video und Anforderung angepasst werden.
+                    {"video": str(video_pfad), "fps": 2},  # 2 fps to reduce API token usage
                     {"text": prompt_text}
                 ]
             }
         ]
-        
-        # API-Aufruf
+
+        # API call
         response = dashscope.MultiModalConversation.call(
             api_key=api_key,
             model=model,
             messages=messages,
             enable_thinking=enable_thinking
         )
-        # Prüfe, ob die Antwort gültig ist
+        # Validate response
         if not response or not hasattr(response, 'output') or response.output is None:
-            print(f"API-Fehler: Ungültige Antwort für {video_pfad.name}")
+            print(f"API error: invalid response for {video_pfad.name}")
             continue
-        
+
         response_text = response.output.choices[0].message.content[0]["text"]
-        print(f"API-Antwort: {response_text}")
-        
-        # JSON parsen (Markdown-Codeblock bereinigen)
+        print(f"API response: {response_text}")
+
+        # Parse JSON (strip markdown code block if present)
         if response_text.startswith("```"):
             response_text = response_text.split("```")[1].strip()
             if response_text.startswith("json"):
                 response_text = response_text[4:].strip()
-        
+
         result = json.loads(response_text)
         alle_ergebnisse.append(result)
-        print("✓ Erfolgreich geparst")
-        
-        # Zwischenspeichern nach jedem erfolgreichen Video
+        print("✓ Successfully parsed")
+
+        # Save incrementally after each successful video
         with open(output_datei, 'w', encoding='utf-8') as f:
             json.dump(alle_ergebnisse, f, indent=2, ensure_ascii=False)
-        print(f"Ergebnisse zwischengespeichert ({len(alle_ergebnisse)} Videos).")
-        
+        print(f"Results saved incrementally ({len(alle_ergebnisse)} videos).")
+
     except Exception as e:
-        print(f"Fehler bei {video_pfad.name}: {e}")
+        print(f"Error processing {video_pfad.name}: {e}")
         continue
 
-# Ergebnisse speichern
+# Final save
 with open(output_datei, 'w', encoding='utf-8') as f:
     json.dump(alle_ergebnisse, f, indent=2, ensure_ascii=False)
 
-print(f"\nErgebnisse gespeichert in: {output_datei}")
+print(f"\nResults saved to: {output_datei}")

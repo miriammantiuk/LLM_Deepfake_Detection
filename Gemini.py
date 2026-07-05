@@ -6,60 +6,60 @@ import json
 from pathlib import Path
 from google.genai import types
 
-# --- KONFIGURATION ---
-# Pfad zur JSON-Datei mit API-Keys
+# --- CONFIGURATION ---
+# Path to the JSON file containing API keys
 api_keys_file = Path("api_keys.json")
 
-# Überprüfe, ob die Datei existiert
+# Check if the file exists
 if not api_keys_file.exists():
-    raise RuntimeError(f"API-Keys-Datei '{api_keys_file}' nicht gefunden. Erstelle eine JSON-Datei mit dem Format: {{'keys': ['key1', 'key2', ...]}}")
+    raise RuntimeError(f"API keys file '{api_keys_file}' not found. Create a JSON file with the format: {{'keys': ['key1', 'key2', ...]}}")
 
-# Lade die API-Keys aus der JSON-Datei
+# Load API keys from the JSON file
 try:
     with open(api_keys_file, 'r', encoding='utf-8') as f:
         keys_data = json.load(f)
     valid_keys = keys_data.get("keys", [])
     if not valid_keys or not isinstance(valid_keys, list):
-        raise RuntimeError("Ungültiges Format in api_keys.json. Erwarte: {'keys': ['key1', 'key2', ...]}")
+        raise RuntimeError("Invalid format in api_keys.json. Expected: {'keys': ['key1', 'key2', ...]}")
 except json.JSONDecodeError as e:
-    raise RuntimeError(f"Fehler beim Laden der API-Keys-Datei: {e}")
+    raise RuntimeError(f"Error loading API keys file: {e}")
 
-# Lade den ersten API-Key
+# Load the first API key
 current_key_index = 0
 api_key = valid_keys[current_key_index].strip()
 
 if not api_key:
-    raise RuntimeError(f"API-Key {current_key_index + 1} ist leer.")
+    raise RuntimeError(f"API key {current_key_index + 1} is empty.")
 
 client = genai.Client(api_key=api_key)
-print(f"Konfiguration erfolgreich mit Key {current_key_index + 1}.")
+print(f"Configuration successful with key {current_key_index + 1}.")
 
-# Funktion zum Wechseln des API-Keys
+# Switch to the next API key (used on quota errors)
 def switch_api_key():
     global current_key_index, api_key, client
     current_key_index = (current_key_index + 1) % len(valid_keys)
     api_key = valid_keys[current_key_index].strip()
     client = genai.Client(api_key=api_key)
-    print(f"API-Key gewechselt zu Key {current_key_index + 1}.")
+    print(f"Switched to API key {current_key_index + 1}.")
 
-# Zähler für Videos pro Key
+# Counter for videos processed per key
 videos_processed = 0
 videos_per_key = 20
 
-# 1. Definiere den Ordner und die Ausgabedatei
+# 1. Define input folder and output file
 video_ordner = Path(r"C:\Users\miria\Deepfake_Detection\data\processed")
 
-# 2. Wähle das Modell (ändere hier den Modellnamen)
+# 2. Select model
 model = "gemini-3.1-flash-lite-preview"
 # model = "gemini-3-flash-preview"
 # model = "gemini-2.5-flash"
 # model = "gemini-2.5-pro"
 
-# Thinking-Konfiguration
-thinking_budget = 0  # -1 für dynamic reasoning, 0 für kein reasoning
+# Thinking configuration
+thinking_budget = 0  # -1 = dynamic reasoning, 0 = disabled
 
-# Indicators-Konfiguration
-indicators_type = "enabled"  # "enabled" für indicators, "disabled" für baseline
+# Indicators configuration
+indicators_type = "enabled"  # "enabled" for indicators prompt, "disabled" for baseline
 
 suffix_parts = []
 if thinking_budget == -1:
@@ -132,7 +132,7 @@ prompt_indicators = """<role>
                         - Keep the justification concise, factual, and forensic.
                         </constraints>"""
 
-# Dynamischer Output-Name basierend auf dem Modellnamen und Thinking-Budget
+# Dynamic output filename based on model name and thinking budget
 output_datei = Path(rf"C:\Users\miria\Deepfake_Detection\{model}{suffix}_3.json")
 alle_ergebnisse = []
 vorhandene_video_ids = set()
@@ -141,51 +141,49 @@ if output_datei.exists():
         with open(output_datei, 'r', encoding='utf-8') as f:
             alle_ergebnisse = json.load(f)
             vorhandene_video_ids = {entry.get("video_id") for entry in alle_ergebnisse if "video_id" in entry}
-        print(f"Geladene bestehende Ergebnisse: {len(alle_ergebnisse)} Videos")
+        print(f"Loaded existing results: {len(alle_ergebnisse)} videos")
     except json.JSONDecodeError:
-        print("Fehler beim Laden der bestehenden JSON-Datei. Starte mit leerer Liste.")
+        print("Error loading existing JSON file. Starting with empty list.")
 
-# 3. Schleife durch alle mp4-Dateien (rekursiv in Unterordnern)
+# 3. Iterate over all MP4 files (recursive)
 videos_list = list(video_ordner.glob("**/*.mp4"))
 for video_pfad in videos_list:
     video_id = video_pfad.stem
     if video_id in vorhandene_video_ids:
-        print(f"--- Überspringe {video_pfad.name} (bereits analysiert) ---")
+        print(f"--- Skipping {video_pfad.name} (already processed) ---")
         continue
-    
-    
-    
-    # API-Key-Rotation nach 20 Videos
+
+    # API key rotation after every N videos
     # if videos_processed % videos_per_key == 0:
         # switch_api_key()
-        # print(f"API-Key gewechselt nach {videos_processed} Videos.")
-    
+        # print(f"API key rotated after {videos_processed} videos.")
+
     processed = False
     retry_count = 0
     while not processed:
         try:
-            print(f"\n--- Beginne Analyse für: {video_pfad.name} ---")
-            
-            # 4. Lade Video hoch
-            print("Lade Video hoch...")
+            print(f"\n--- Starting analysis for: {video_pfad.name} ---")
+
+            # 4. Upload video
+            print("Uploading video...")
             video_file = client.files.upload(file=video_pfad)
-            
-            # 5. Warte auf Verarbeitung (optional, da API automatisch wartet)
-            print("Video wird verarbeitet...")
+
+            # 5. Wait for processing
+            print("Processing video...")
             while video_file.state.name == "PROCESSING":
-                print("Warte auf Verarbeitung...")
+                print("Waiting for processing...")
                 time.sleep(10)
                 video_file = client.files.get(name=video_file.name)
-            
+
             if video_file.state.name == "FAILED":
-                print(f"Verarbeitung für {video_pfad.name} fehlgeschlagen.")
+                print(f"Processing failed for {video_pfad.name}.")
                 continue
-                
-            print("Video ist bereit.")
-            
-            # 6. Analysiere das Video
+
+            print("Video is ready.")
+
+            # 6. Analyse video
             prompt = prompt_indicators if add_indicators else prompt_baseline
-            
+
             response = client.models.generate_content(
                 model=model,
                 contents=[video_file, prompt],
@@ -193,67 +191,65 @@ for video_pfad in videos_list:
                 thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget) #, temperature=0
                 )
             )
-            
-            print(f"Antwort für {video_pfad.name}:\n{response.text}\n")
-            
-            # 7. Parse JSON und speichere es
+
+            print(f"Response for {video_pfad.name}:\n{response.text}\n")
+
+            # 7. Parse JSON and save
             try:
                 response_text = response.text.strip()
-                
-                # Entferne alles vor dem ersten '{'
+
+                # Strip everything before the first '{'
                 start_idx = response_text.find('{')
                 if start_idx != -1:
                     response_text = response_text[start_idx:]
-                
-                # Entferne alles nach dem letzten '}'
+
+                # Strip everything after the last '}'
                 end_idx = response_text.rfind('}')
                 if end_idx != -1:
                     response_text = response_text[:end_idx + 1]
-                
+
                 if response_text.startswith("```"):
                     response_text = response_text.split("```")[1]
                     if response_text.startswith("json"):
                         response_text = response_text[4:]
                     response_text = response_text.strip()
-                
+
                 result = json.loads(response_text)
                 result["video_id"] = video_pfad.stem
                 alle_ergebnisse.append(result)
-                print(f"✓ JSON erfolgreich geparst für {video_pfad.name}")
-                
-                # Zwischenspeichern nach jedem erfolgreichen Video
+                print(f"✓ JSON successfully parsed for {video_pfad.name}")
+
+                # Save incrementally after each successful video
                 with open(output_datei, 'w', encoding='utf-8') as f:
                     json.dump(alle_ergebnisse, f, indent=2, ensure_ascii=False)
-                print(f"Ergebnisse zwischengespeichert ({len(alle_ergebnisse)} Videos).")
-                
-                # Zähler für Videos erhöhen (einmal pro Video)
+                print(f"Results saved incrementally ({len(alle_ergebnisse)} videos).")
+
                 videos_processed += 1
-                print(f"Videos verarbeitet: {videos_processed}")
+                print(f"Videos processed: {videos_processed}")
             except json.JSONDecodeError as e:
-                print(f"✗ JSON Parse-Fehler für {video_pfad.name}: {e}")
-                print(f"  Raw Response: {response.text[:200]}")
-            
-                # 9. Aufräumen
+                print(f"✗ JSON parse error for {video_pfad.name}: {e}")
+                print(f"  Raw response: {response.text[:200]}")
+
+                # 9. Cleanup (optional)
                 #client.files.delete(file=video_pfad)
-                #print("Datei vom Server gelöscht.")
-                
+                #print("File deleted from server.")
+
             processed = True
-        
+
         except Exception as e:
             error_msg = str(e).lower()
             if ("quota" in error_msg or "limit" in error_msg or "exhausted" in error_msg or "rate" in error_msg) and retry_count < len(valid_keys):
-                print(f"API-Fehler erkannt bei {video_pfad.name}: {e}")
+                print(f"API error for {video_pfad.name}: {e}")
                 switch_api_key()
                 retry_count += 1
-                print(f"Retry {retry_count} für {video_pfad.name} mit neuem Key (Key {current_key_index + 1}).")
+                print(f"Retry {retry_count} for {video_pfad.name} with new key (key {current_key_index + 1}).")
             else:
-                print(f"Fehler bei {video_pfad.name}: {e}")
+                print(f"Error processing {video_pfad.name}: {e}")
                 processed = True
 
-# 10. Speichere alle Ergebnisse in eine JSON-Datei
+# 10. Final save
 with open(output_datei, 'w', encoding='utf-8') as f:
     json.dump(alle_ergebnisse, f, indent=2, ensure_ascii=False)
 
-print(f"\n--- Alle Videos analysiert ---")
-print(f"Ergebnisse gespeichert in: {output_datei}")
-
+print(f"\n--- All videos processed ---")
+print(f"Results saved to: {output_datei}")
